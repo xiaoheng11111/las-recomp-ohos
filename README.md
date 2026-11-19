@@ -104,6 +104,8 @@ libdav1d、libopus、OpenSSL、libxml2、libbluray、SoundTouch 等均为**第�
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 - [docs/PORTING.md](docs/PORTING.md)
+- [docs/DATA_TRANSCODE.md](docs/DATA_TRANSCODE.md)（视频/纹理转码方法与边界）
+- [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)
 
 ---
 
