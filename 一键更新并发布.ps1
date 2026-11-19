@@ -18,6 +18,32 @@ if ([string]::IsNullOrWhiteSpace($origin)) {
     Pause-Exit
 }
 
+# ---------- 代理检测（git 不读 Windows 系统代理，需要显式设置） ----------
+function Test-GitHub443 {
+    $c = New-Object Net.Sockets.TcpClient
+    try {
+        $r = $c.BeginConnect('github.com', 443, $null, $null)
+        if ($r.AsyncWaitHandle.WaitOne(4000)) { $c.EndConnect($r); return $true }
+    } catch { } finally { $c.Close() }
+    return $false
+}
+$proxy = ''
+$ie = Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings' -ErrorAction SilentlyContinue
+if ($ie -and $ie.ProxyEnable -eq 1 -and $ie.ProxyServer) {
+    $p = [string]$ie.ProxyServer
+    if ($p -notmatch '^https?://') { $p = 'http://' + $p }
+    $proxy = $p
+}
+if (-not $proxy -and -not (Test-GitHub443)) {
+    Say '检测到无法直连 github.com:443。' 'Yellow'
+    $proxy = Read-Host '请输入代理地址（例如 http://127.0.0.1:7877；直接回车跳过）'
+}
+if ($proxy) {
+    $env:HTTP_PROXY = $proxy
+    $env:HTTPS_PROXY = $proxy
+    Say "使用代理：$proxy" 'Yellow'
+}
+
 # ---------- 1. 提交并推送仓库（截图/文档更新） ----------
 $dirty = git status --porcelain
 if ($dirty) {
@@ -26,8 +52,21 @@ if ($dirty) {
     git commit -m ("update: docs/screenshots " + (Get-Date -Format 'yyyy-MM-dd HH:mm'))
 }
 Say '正在推送到 GitHub…'
-git push origin main
-if ($LASTEXITCODE -ne 0) { Say '推送失败（可能是登录过期）。如果弹出登录窗口，请用浏览器登录后重试。' 'Red'; Pause-Exit }
+if ($proxy) {
+    $out = git -c "http.proxy=$proxy" -c "https.proxy=$proxy" push origin main 2>&1
+} else {
+    $out = git push origin main 2>&1
+}
+$out | ForEach-Object { Write-Host $_ }
+if ($LASTEXITCODE -ne 0) {
+    $txt = ($out | Out-String)
+    if ($txt -match 'Could not connect|Failed to connect|curl 28|Connection timed out|timed out|hung up') {
+        Say '推送失败：无法连接 github.com:443。请确认代理/VPN 已开启（脚本已尝试系统代理）。' 'Red'
+    } else {
+        Say '推送失败：可能是登录过期或权限问题。若弹出登录窗口，请用浏览器登录后重试。' 'Red'
+    }
+    Pause-Exit
+}
 
 # ---------- 2. 生成 FFmpeg 8.1.2 包 ----------
 $ffDefault = Join-Path (Split-Path $repoDir -Parent) 'repo\letsgo-recomp-android-master\platform\ohos\ffmpeg-arm64'
