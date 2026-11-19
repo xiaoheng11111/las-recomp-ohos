@@ -80,6 +80,14 @@ screenshots/                 运行截图（仅展示，不含游戏数据）
 
 ---
 
+## 第三方依赖与许可证
+
+FFmpeg 8.1.2（OHOS universal，构建工程参考 [debugly/MRFFToolChainBuildShell](https://github.com/debugly/MRFFToolChainBuildShell)）、
+libdav1d、libopus、OpenSSL、libxml2、libbluray、SoundTouch 等均为**第三方开源组件**。
+本项目只注明来源与许可证，不声称自研，也不把预编译 `.a` 放进 git（建议用 GitHub Release 分发，并附许可证与源码获取方式）。
+
+详见 [docs/THIRD_PARTY.md](docs/THIRD_PARTY.md)。
+
 ## 工作原理（简述）
 
 - **HLE（High Level Emulation）**：`runtime/src/runtime/hle` 用宿主实现 Switch 系统服务
