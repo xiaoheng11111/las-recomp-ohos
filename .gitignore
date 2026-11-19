@@ -1,0 +1,63 @@
+# HarmonyOS / DevEco build outputs
+.hvigor/
+oh_modules/
+entry/build/
+entry/.cxx/
+build/
+*.hap
+*.app
+*.har
+*.hsp
+
+# Native build artifacts / prebuilt libraries (build them yourself, see README)
+*.so
+*.a
+*.o
+*.obj
+*.dylib
+*.dll
+*.lib
+
+# Game data / dumps -- never commit (copyrighted, and huge)
+game-data/
+game_data/
+romfs
+romfs.bin
+romfs.gz
+*.romfs
+*.nsp
+*.xci
+*.nca
+*.ncz
+*.nsz
+*.xcz
+exefs/
+*.tik
+*.keys
+*.cert
+
+# Signing material
+local.properties
+*.p12
+*.p7b
+*.pem
+*.key
+*.cer
+*.csr
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs / temporary / archives
+*.log
+*.tmp
+*.bak
+*.orig
+*.rej
+*.zip
+*.7z
+*.rar

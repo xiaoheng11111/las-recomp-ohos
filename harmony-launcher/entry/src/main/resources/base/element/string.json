@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "LAS 鸿蒙原生启动器"
+    },
+    {
+      "name": "EntryAbility_desc",
+      "value": "启动器主界面"
+    },
+    {
+      "name": "EntryAbility_label",
+      "value": "宝可梦伊布"
+    },
+    {
+      "name": "reason_download",
+      "value": "读取下载目录中的游戏数据文件"
+    }
+  ]
+}

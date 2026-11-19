@@ -1,0 +1,11 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "las_launcher",
+  "version": "0.1.0",
+  "description": "HarmonyOS native launcher for the LAS recompilation port",
+  "main": "",
+  "author": "",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
