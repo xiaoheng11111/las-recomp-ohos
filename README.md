@@ -28,9 +28,11 @@
 
 ## 截图（实机全屏，保留游戏原始 16:9 的黑边）
 
-| 封面 | 启动开场 | 游戏内 |
-|---|---|---|
-| ![](screenshots/01-cover-full.jpeg) | ![](screenshots/02-game-opening.jpeg) | ![](screenshots/03-game-room.jpeg) |
+| 封面 | 启动开场 |
+|---|---|
+| ![](screenshots/01-cover-full.jpeg) | ![](screenshots/02-game-opening.jpeg) |
+| 游戏内 | 户外植被场景（示例约 18 fps / 104 ms） |
+| ![](screenshots/03-game-room.jpeg) | ![](screenshots/04-outdoor-fps.jpeg) |
 
 ## 上游遗留问题：游戏文字不可见（已修复）
 
@@ -148,7 +150,7 @@ harmony-launcher/entry/src/main/cpp/third_party/liblasgame.so
 
 ## 已知问题 / 现状
 
-- 帧率受设备 GPU/CPU 影响较大（野外植被 draw call 多时掉帧明显）；
+- 户外/植被场景帧率下降明显（实机示例：18 fps / 104 ms，仅作参考，随设备与场景变化）；主因是绘制调用（draw calls）的 CPU 瓶颈，降低分辨率帮助有限，后续方向是合批/实例化；
 - 标题动画呈现阶段可能有掉帧；
 - 稳定版运行时下，「＋/－」触发的 ImGui 菜单可能崩溃（已回退到稳定运行库以优先保证游戏不闪退）；
 - 语言与「跳过选择手柄画面」依赖游戏本体行为，可能不响应；
