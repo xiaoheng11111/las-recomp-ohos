@@ -70,6 +70,11 @@ screenshots/                 运行截图（仅展示，不含游戏数据）
 - **启动器**：ArkTS 负责封面、数据导入（zip/romfs.gz）、显示设置、游戏设置与虚拟按键，
   C++ 桥把 XComponent 的 Surface 交给运行时并 `dlopen` 它。
 
+更完整的**架构说明与移植原理**（数据流、接口契约、各层职责、缺失部分如何用自己的代码独立实现）：
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- [docs/PORTING.md](docs/PORTING.md)
+
 ---
 
 ## 构建步骤
