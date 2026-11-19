@@ -61,3 +61,6 @@ desktop.ini
 *.zip
 *.7z
 *.rar
+
+# release assets (built locally, upload to GitHub Release)
+dist/
