@@ -677,11 +677,16 @@ static void create_device(void) {
     const char *ext[8];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    // 二分排查 vkCreateDevice -3：可选扩展全部关闭（只留 swapchain）
-    g_vk.custom_border = false;
-    g_vk.divisor = false;
-    g_vk.host_import = false;
-    bool fault = false;
+    // 恢复官方逻辑：按驱动实际支持的扩展逐个开启（此前二分排查时被强行关闭，
+    // 导致 host_import 恒为 false → 只能走 gcopy → guest heap 读不到 → 顶点/常量全 0 → 蓝屏）
+    g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
+    g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     // LARECOMP_PIPE_STATS: what the driver says about each compiled shader (registers, spills, ...), exec.c pipe_exec_report
     g_pipe_exec_stats = getenv("LARECOMP_PIPE_STATS") && has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (g_pipe_exec_stats) ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
@@ -699,6 +704,40 @@ static void create_device(void) {
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have13};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     LOG("[vk] features: dynamicRendering=%d sync2=%d maintenance4=%d shaderInt64=%d\n", have13.dynamicRendering, have13.synchronization2, have13.maintenance4, have.features.shaderInt64);
+    // ============================================================================================
+    // 【驱动兼容降级开关（对齐 Android v0128/v0129 的做法）—— 不要当成无用代码删掉】
+    //
+    // 为什么保留：
+    //   某些移动 GPU 驱动（含华为 Maleoon）会「声称」支持 dynamic rendering / synchronization2，
+    //   但在特定场景（游戏内菜单、场景转场、stencil 遮罩、多 pass 依赖）下才暴露实现缺陷：
+    //   表现为管线创建失败、画面错乱、或直接 SIGSEGV，且普通画面完全正常 —— 极难复现定位。
+    //   这两个开关让同一份 so 可以不重编就切到老路径验证，是排查这类问题的唯一手段。
+    //
+    // 用法（运行时环境变量，不需要重新编译）：
+    //   LARECOMP_NO_DYN_RENDER=1  强制关闭 dynamic rendering，改用 VkRenderPass + framebuffer
+    //   LARECOMP_NO_SYNC2=1       强制关闭 synchronization2，改用 Vulkan 1.0 的 barrier/submit
+    //   两个都设 = 最大兼容模式（帧率略降，但驱动走最成熟的路径）
+    //
+    // 【历史教训 —— 不要重犯】
+    //   1) 曾因为「没有任何日志输出」就断定开关没生效而删掉。实际上开关是惰性的：
+    //      只有设置了环境变量才打日志，默认不输出任何东西，这是刻意设计，不是坏了。
+    //   2) 崩溃时优先试这两个开关做二分：若 LARECOMP_NO_DYN_RENDER=1 就不崩，
+    //      说明是 dynamic rendering 路径的驱动缺陷；若 NO_SYNC2=1 才不崩，则是同步 2 的问题。
+    //      结论比对着源码猜快一个数量级。
+    //   3) 开关状态会写进 g_vk.dyn_render / g_vk.sync2，供 exec.c 里选择管线路径，
+    //      删字段会导致 exec.c 编译失败。
+    // 默认（不设环境变量）：完全按驱动上报的能力走，不做任何降级 —— 性能最好。
+    // ============================================================================================
+    bool force_no_dyn = getenv("LARECOMP_NO_DYN_RENDER") != NULL;
+    bool force_no_sync2 = getenv("LARECOMP_NO_SYNC2") != NULL;
+    if (force_no_dyn && have13.dynamicRendering)
+        LOG("[vk] dynamic rendering forced OFF (LARECOMP_NO_DYN_RENDER), using render-pass fallback\n");
+    if (force_no_sync2 && have13.synchronization2)
+        LOG("[vk] sync2 forced off (LARECOMP_NO_SYNC2): using 1.0 barriers/submit\n");
+    bool use_dyn = have13.dynamicRendering && !force_no_dyn;
+    bool use_sync2 = have13.synchronization2 && !force_no_sync2;
+    g_vk.dyn_render = use_dyn;
+    g_vk.sync2 = use_sync2;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -707,8 +746,8 @@ static void create_device(void) {
         .customBorderColorWithoutFormat = VK_FALSE, .pNext = g_vk.divisor ? &div : NULL};  // 官方：仅请求支持的）
 
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                            .dynamicRendering = have13.dynamicRendering,
-                                            .synchronization2 = have13.synchronization2,
+                                            .dynamicRendering = use_dyn,
+                                            .synchronization2 = use_sync2,
                                             .shaderDemoteToHelperInvocation = have13.shaderDemoteToHelperInvocation,
                                             .shaderTerminateInvocation = have13.shaderTerminateInvocation,
                                             .maintenance4 = have13.maintenance4,

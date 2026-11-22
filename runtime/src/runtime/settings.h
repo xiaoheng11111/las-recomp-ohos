@@ -37,6 +37,7 @@ typedef struct {
     char game_lang[8];   // the game's language code ("en-US", "es"...: runtime/mods.c game_language)
     char mod[512];       // active mods / fan translations (mods/<name>/, "a, b": several), empty = none (runtime/mods.h)
     int tex_quality;     // 0..100: material texture precision (anisotropy + mip bias; 100 = sharpest)
+    int astc_quality;    // 0..100: astcenc effort for BC->ASTC transcoding (0 = fastest, 100 = best)
 } Settings;
 
 extern Settings g_settings;

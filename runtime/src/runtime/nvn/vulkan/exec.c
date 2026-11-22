@@ -17,6 +17,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "../bc.h"       // bc_decode_ldr: BC 纹理的 buffer -> image 拷贝要走 CPU 解码（无 BC 支持的移动 GPU）
 #include "../renderer.h"
 // Forward declaration for hmix (defined as static later)
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
@@ -3796,6 +3797,48 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
         if (nlog++ < 5) LOG("[vk] buffer -> ASTC texture copy skipped (%ux%u)\n", t->width, t->height);
         return;
     }
+    // BC 纹理在 GPU 上是 RGBA8（无 BC 支持的移动 GPU 走 CPU 解码，见 textures.c），但 guest 传过来的源数据是
+    // 压缩块。原来这里会按每纹素 bpb 逐行 memcpy，把 8/16 字节的块当成 4 字节 RGBA 纹素直通 —— GPU 采到的
+    // 就是块头/索引字节，表现为**彩色噪点 + 水平条纹**（画面里 5 个菜单图标正是这种症状）。
+    // 修法：先按块行把 guest 的源数据拷出来，再做 BC 解码，最后按 RGBA8 行距上传。
+    if (b->bc_kind) {
+        const int bkind = (int)b->bc_kind;
+        const uint32_t bs = vk_bc_block_bytes(bkind);
+        // 归一化区域：rg[3]/rg[4] 为 0 表示「整个纹理」，与 copy_region_dims 的约定一致。
+        // 块表必须恰好覆盖 ceil(w/4) x ceil(h/4)，否则 block 指针会读到块表外（尾部就是噪声）。
+        const uint32_t ow = (uint32_t)rg[3] ? (uint32_t)rg[3] : t->width;
+        const uint32_t oh = (uint32_t)rg[4] ? (uint32_t)rg[4] : t->height;
+        const uint32_t src_bw = (ow + 3) / 4;
+        const uint32_t src_bh = (oh + 3) / 4;
+        if (!ow || !oh || level < 0 || level >= (int)b->levels) return;
+        {   // 诊断：首次出现时打一行，主 Agent 在真机上跑一次菜单就能确认这条路径是否被走到
+            static int nbc;
+            if (nbc++ < 8)
+                LOG("[vk] buf2tex BC: nvn fmt %#x kind %d %ux%u region %d,%d %dx%d -> decoded RGBA8 (%u blocks/row)\n",
+                    t->format, bkind, t->width, t->height, rg[0], rg[1], rg[3], rg[4], src_bw);
+        }
+        // guest 的源行距：优先用命令里设置的 copy row stride，否则按块行紧凑排列（ceil(w/4)*bs）
+        const uint64_t bc_row = st.copy_row_stride ? st.copy_row_stride : (uint64_t)src_bw * bs;
+        const uint64_t blocks_bytes = (uint64_t)src_bw * src_bh * bs;
+        uint8_t *blocks = malloc(blocks_bytes ? blocks_bytes : 1);
+        if (!blocks) {
+            static int nm;
+            if (nm++ < 5) LOG("[vk] buf2tex BC: malloc %llu failed, copy skipped\n", (unsigned long long)blocks_bytes);
+            return;
+        }
+        // 源数据按 guest 行距逐块行拷成紧凑块表；注意 src 是 guest 物理地址，越界保护交给上层（src 由命令给出）
+        for (uint32_t y = 0; y < src_bh; y++)
+            memcpy(blocks + (uint64_t)y * src_bw * bs,
+                   (const uint8_t *)(uintptr_t)(src + (uint64_t)y * bc_row), src_bw * bs);
+        VkSpan dec = vk_transient((uint64_t)ow * oh * 4, 16);
+        bc_decode_ldr(blocks, ow, oh, bkind, b->bc_srgb != 0, dec.ptr);
+        free(blocks);
+        VkBufferImageCopy c = {.bufferOffset = dec.off, .bufferRowLength = ow, .bufferImageHeight = oh,
+                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 0, 1},
+                               .imageOffset = {rg[0], rg[1], 0}, .imageExtent = {ow, oh, 1}};
+        vkCmdCopyBufferToImage(vk_cmd(), dec.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        return;
+    }
     bool array = b->layers > 1 && b->depth == 1;
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
     uint32_t out_bpb = fi->bpb == 3 ? 4 : fi->bpb;
@@ -3830,6 +3873,16 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     copy_region_dims(t, src, &fi, rg, &level, &row, &img);
     if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) return;
     TexBackend *b = vk_tex(t, false);
+    // BC 纹理在 GPU 上存的是 CPU 解码后的 RGBA8（见 textures.c），不是压缩块。把这个图像按"块"读回 guest
+    // 内存会写进错长度的数据，把那片 guest 纹理内存弄脏 —— 之后 upload_texture 再按 BC 解，就是一片噪声。
+    // 反向重编码 BC 没有实现（bc.c 只有解码器），所以这里宁可跳过，也不要污染 guest 的源数据。
+    if (b->bc_kind) {
+        static int nbc;
+        if (nbc++ < 5)
+            LOG("[vk] tex2buf BC skipped: nvn fmt %#x kind %d %ux%u level %d (decoded RGBA8 cannot be re-encoded)\n",
+                t->format, (int)b->bc_kind, t->width, t->height, level);
+        return;
+    }
     float tsx, tsy;
     renderer_texture_scale(t, &tsx, &tsy);
     VkCommandBuffer cb = vk_cmd();

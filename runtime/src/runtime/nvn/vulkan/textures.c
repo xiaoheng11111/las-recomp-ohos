@@ -14,8 +14,10 @@
 
 #include "vk.h"
 #include "../../diag.h"
+#include "../../rt.h"
 #include "../../settings.h"
 #include "../astc.h"
+#include "../astc_rt.h"
 #include "../bc.h"
 #include "../renderer.h"
 
@@ -276,10 +278,11 @@ static void create_image(NvnTexture *t, TexBackend *b) {
     VkFormat vf = mf.vf;
     VkFormatFeatureFlags need = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
     b->astc_bw = b->astc_bh = 0;
-    b->bc_kind = b->bc_srgb = 0;
+    b->bc_kind = b->bc_srgb = b->bc_astc = 0;
     if (!format_supports(vf, need)) {
         bool astc = vf >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK && vf <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
         int bck = (vf == VK_FORMAT_BC1_RGBA_UNORM_BLOCK || vf == VK_FORMAT_BC1_RGBA_SRGB_BLOCK) ? 1
+                : (vf == VK_FORMAT_BC2_UNORM_BLOCK || vf == VK_FORMAT_BC2_SRGB_BLOCK) ? 2
                 : (vf == VK_FORMAT_BC3_UNORM_BLOCK || vf == VK_FORMAT_BC3_SRGB_BLOCK) ? 3
                 : (vf == VK_FORMAT_BC4_UNORM_BLOCK || vf == VK_FORMAT_BC4_SNORM_BLOCK) ? 4
                 : (vf == VK_FORMAT_BC5_UNORM_BLOCK || vf == VK_FORMAT_BC5_SNORM_BLOCK) ? 5
@@ -291,13 +294,43 @@ static void create_image(NvnTexture *t, TexBackend *b) {
             b->astc_srgb = t->format >= 0x87;
             vf = b->astc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
         } else if (bck && fi && fi->bpb == ((bck == 1 || bck == 4) ? 8 : 16)) {
-            // Maleoon (and other mobile GPUs) have no BC: decode BC1/3/4/5 into RGBA8 on upload
+            // Maleoon (and other mobile GPUs) have no BC. Preferred: transcode BC -> ASTC 4x4 on upload so the
+            // GPU samples a format it supports natively (keeps 4x4 block layout, 16 bytes/block, same colour
+            // space); RGBA8 decode is the fallback when ASTC or astcenc is unavailable.
             b->bc_kind = (uint8_t)bck;
-            b->bc_srgb = (uint8_t)(t->format == 0x45 || t->format == 0x46 || t->format == 0x48 || t->format == 0x4E);
-            vf = b->bc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            b->bc_srgb = (uint8_t)(t->format == 0x45 || t->format == 0x46 || t->format == 0x47 || t->format == 0x48 || t->format == 0x4E);
+            VkFormat af = b->bc_srgb ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK : VK_FORMAT_ASTC_4x4_UNORM_BLOCK;
+            {   // ★ v6b 诊断：打印 ASTC 决策链路。LARECOMP_ASTC_LOG=1 不限条数，否则 20 条。
+                static int nlog, log_max = -2;
+                if (log_max == -2) log_max = getenv("LARECOMP_ASTC_LOG") ? 1 << 30 : 20;
+                if (nlog++ < log_max) {
+                    int rt = (int)astc_rt_enabled();
+                    int sup = (int)format_supports(af, need);
+                    LOG("[astc-decide] nvn=%#x %ux%u lv=%u bck=%d srgb=%d bpb=%d astc_rt=%d no_astc=%d supports=%d -> %s\n",
+                        t->format, t->width, t->height, t->levels, bck, (int)b->bc_srgb,
+                        fi ? (int)fi->bpb : -1, rt, (int)b->bc_no_astc, sup,
+                        (rt && !b->bc_no_astc && sup) ? "ASTC" : "RGBA8");
+                }
+            }
+            if (astc_rt_enabled() && !b->bc_no_astc && format_supports(af, need)) {
+                b->bc_astc = 1;
+                vf = af;
+            } else {
+                vf = b->bc_srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            }
         } else {
-            static int nlog;
-            if (nlog++ < 20) LOG("[vk] format %d (nvn %#x) not supported: RGBA8 instead\n", vf, t->format);
+            // 降级日志：默认限流 20 条（避免刷屏）。排查菜单图标花屏时用
+            // LARECOMP_FMT_LOG_ALL=1（不限条数）或 LARECOMP_FMT_LOG_MAX=<n> 指定上限，
+            // 这样能确认某张纹理到底有没有被静默降级成 RGBA8。
+            static int nlog, log_max = -2;
+            if (log_max == -2) {
+                log_max = 20;
+                if (getenv("LARECOMP_FMT_LOG_ALL")) log_max = 1 << 30;
+                else if (getenv("LARECOMP_FMT_LOG_MAX")) log_max = atoi(getenv("LARECOMP_FMT_LOG_MAX"));
+            }
+            if (nlog++ < log_max)
+                LOG("[vk] format %d (nvn %#x) not supported: RGBA8 instead  [%ux%u lv %u target %u flags %#x]\n",
+                    vf, t->format, t->width, t->height, t->levels, t->target, t->flags);
             vf = VK_FORMAT_R8G8B8A8_UNORM;
         }
     }
@@ -330,6 +363,24 @@ static void create_image(NvnTexture *t, TexBackend *b) {
                  : type == VK_IMAGE_TYPE_3D ? VK_IMAGE_VIEW_TYPE_3D
                  : t->target == 8 ? VK_IMAGE_VIEW_TYPE_CUBE : t->target == 9 ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY
                  : layers > 1 || t->target == 4 || t->target == 6 ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+    // 诊断（LARECOMP_TEX_AUDIT=1）：纹理最终落到 GPU 的真实格式/尺寸/块信息。
+    // 菜单 5 个图标花屏时，这里能直接看出它们是否走 BC 软解、尺寸/stride 与 guest 侧是否一致。
+    // （放在这里是因为 bc_kind / astc_bw 直到上面才全部确定）
+    {
+        static int tex_audit = -1;
+        if (tex_audit < 0) tex_audit = getenv("LARECOMP_TEX_AUDIT") ? 1 : 0;
+        if (tex_audit) {
+            static int na;
+            if (na++ < 400)
+                LOG("[tex-audit-v3] nvn fmt %#x %ux%u lv %u target %u flags %#x -> vk fmt %d %ux%u bc_kind %d srgb %d "
+                    "astc_bw %d bpb %d bw %d bh %d bh_log2 %u wa %u addr %llx stride %llu\n",
+                    t->format, t->width, t->height, t->levels, t->target, t->flags, (int)vf, b->width, b->height,
+                    (int)b->bc_kind, (int)b->bc_srgb, (int)b->astc_bw, t->layout.fmt ? t->layout.fmt->bpb : -1,
+                    t->layout.fmt ? t->layout.fmt->bw : -1, t->layout.fmt ? t->layout.fmt->bh : -1,
+                    t->layout.block_height_log2, t->layout.packaged_width_log2,
+                    (unsigned long long)t->addr, (unsigned long long)t->stride);
+        }
+    }
     vk_image_init_layout(vk_upload_cmd(), b->image, b->aspect);
     if (depthfmt) {
         // New depth / stencil images start zeroed (as fresh memory reads on Apple GPUs). The game builds its depth
@@ -640,6 +691,26 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
         }
     }
     if (t->flags & 0x10) b->dynamic = true;
+    // 诊断（LARECOMP_TEX_AUDIT=1）：BC 纹理每级上传的块布局。菜单图标花屏时，这几行能直接判定
+    // 「块行距/块数/解码尺寸」哪一项和 guest 侧不一致。
+    if (b->bc_kind) {
+        static int audit2 = -1;
+        if (audit2 < 0) audit2 = getenv("LARECOMP_TEX_AUDIT") ? 1 : 0;
+        if (audit2) {
+            static int nb2;
+            if (nb2++ < 200) {
+                LevelLayout l0 = tegra_level(&t->layout, 0);
+                size_t bs0 = (b->bc_kind == 1 || b->bc_kind == 4) ? 8u : 16u;
+                LOG("[bc-audit] nvn fmt %#x kind %d %ux%u lv %u levels %u target %u flags %#x | L0: w %u h %u wb %u hb %u "
+                    "off %llu bs %zu block_bytes %llu | guest stride %llu (要用的行距 %llu) | t->addr %llx total %llu linear %d\n",
+                    t->format, (int)b->bc_kind, t->width, t->height, t->levels, b->levels, t->target, t->flags,
+                    l0.w, l0.h, l0.wb, l0.hb, (unsigned long long)l0.offset, bs0,
+                    (unsigned long long)((uint64_t)l0.wb * l0.hb * bs0),
+                    (unsigned long long)t->stride, (unsigned long long)(t->stride ? t->stride : (uint64_t)l0.wb * bs0),
+                    (unsigned long long)t->addr, (unsigned long long)total, (int)((t->flags & 0x10) != 0));
+            }
+        }
+    }
     if (full_hash_budget_frame != frame) { full_hash_budget_frame = frame; full_hash_budget = 4 << 20; }
     const uint8_t *mem = (const uint8_t *)(uintptr_t)t->addr;
     static int always_full = -1;
@@ -676,39 +747,148 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
     if (layers > b->layers && b->depth == 1) layers = b->layers;
     uint64_t layer_size = tegra_layer_size(&t->layout);
     bool linear = (t->flags & 0x10) != 0;
+    // ★ 二分诊断开关（只影响 BC 纹理，默认不改变既有行为）：
+    //   LARECOMP_BC_LINEAR=1  → 强制把 BC 纹理当「linear（非 block-linear）」读
+    //   LARECOMP_BC_LINEAR=0  → 强制走 tegra_deswizzle（与现在默认的 flags&0x10 逻辑一致）
+    //   不设                    → 保持原逻辑 (flags & 0x10)
+    // 目的：若图标的 guest 数据其实是 linear，而我们当 block-linear 去解，就会得到
+    //       「有内容但错位 + 横向条纹」的花屏 —— 与真机观察完全一致。用这个开关一次就能二分。
+    {
+        static int bc_linear_force = -1;
+        if (bc_linear_force == -1) {
+            const char *e = getenv("LARECOMP_BC_LINEAR");
+            bc_linear_force = (e && *e) ? (atoi(e) ? 1 : 2) : 0;  // 0=未设, 1=强制linear, 2=强制swizzle
+        }
+        if (bc_linear_force == 1) linear = true;
+        else if (bc_linear_force == 2) linear = false;
+    }
     uint32_t levels = t->layout.levels < b->levels ? t->layout.levels : b->levels;
     for (uint32_t layer = 0; layer < layers; layer++) {
         for (uint32_t lv = 0; lv < levels; lv++) {
             LevelLayout l = tegra_level(&t->layout, lv);
-            if (b->bc_kind) {  // BC blocks -> linear block rows -> RGBA8 texels
+            if (b->bc_kind) {  // BC blocks -> linear block rows -> ASTC 4x4 (or RGBA8) texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
                 size_t bs = (b->bc_kind == 1 || b->bc_kind == 4) ? 8u : 16u;
-                uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * bs);
-                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * bs, src + (uint64_t)y * t->stride, l.wb * bs);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, (int)bs, l.block_height_log2, l.block_depth_log2);
+                uint64_t nblocks = (uint64_t)l.wb * l.hb * bs;
+                // Safety belt (upstream just leaves a blank RGBA8 image): if the guest address is not mapped or the
+                // read would run past the guest region, or the scratch malloc fails under memory pressure, skip this
+                // level instead of dereferencing a bad/NULL pointer (that was a SIGSEGV in the menu).
+                if (!t->addr || t->addr < GUEST_LO || t->addr + layer * layer_size + l.offset + nblocks > GUEST_HI) {
+                    continue;  // (image stays as whatever is there: blank/uninitialised, like the upstream fallback)
+                }
+                uint8_t *blocks = malloc(nblocks);
+                if (!blocks) { LOG("[bc] scratch malloc failed (%llu bytes), level skipped\n", (unsigned long long)nblocks); continue; }
+                if (linear) {
+                    // 线性（非 swizzle）BC 纹理的 guest 行距 = 每块行字节数 = wb * bs。
+                    // t->stride 是 nvnTextureBuilderSetStride 存下来的值，游戏对压缩纹理常常不设（=0）；
+                    // 若直接拿 0 当行距，每一行都会从同一个地址读 → 块行全部重复，正是「水平条纹」花屏。
+                    uint64_t src_pitch = t->stride ? t->stride : (uint64_t)l.wb * bs;
+                    for (uint32_t y = 0; y < l.hb; y++)
+                        memcpy(blocks + (uint64_t)y * l.wb * bs, src + (uint64_t)y * src_pitch, l.wb * bs);
+                } else {
+                    tegra_deswizzle(src, blocks, l.wb, l.hb, 1, (int)bs, l.block_height_log2, l.block_depth_log2,
+                                    t->layout.packaged_width_log2);
+                }
+                // ★ 决定性诊断：在解码前把「反 swizzle 之后的紧凑块表」dump 出来。
+                // 与 bcraw_*.bin（guest 原始字节）配合，可以精确判断：
+                //   - bcraw 和 blocks 相同  → 纹理本来就是 linear（不该 swizzle）
+                //   - bcraw 和 blocks 不同  → swizzle 生效了；若 blocks 看起来乱 → swizzle 参数错
+                //   - blocks 正确但 RGBA 错 → 解码器错
+                {
+                    static int dump_blocks = -1, dump_mips = -1;
+                    if (dump_blocks < 0) dump_blocks = getenv("LARECOMP_BC_DUMP_BLOCKS") ? 1 : 0;
+                    if (dump_mips < 0) dump_mips = getenv("LARECOMP_BC_DUMP_MIPS") ? 1 : 0;
+                    if (dump_blocks && (lv == 0 || dump_mips) && layer == 0) {
+                        static int nb;
+                        int lim = getenv("LARECOMP_BC_DUMP_BLOCKS") ? atoi(getenv("LARECOMP_BC_DUMP_BLOCKS")) : 0;
+                        if (!lim) lim = 1 << 30;   // ★ 0 = 不限；原来的 32 会静默截断（之前只抓到 32 张就是这个原因）
+                        if (nb < lim) {
+                            const char *root = getenv("LARECOMP_DATA_ROOT");
+                            char bp[400];
+                            if (root) snprintf(bp, sizeof bp, "%s/bcblk_%llx_L%u_%ux%u_k%d.wb%u_hb%u_bh%d.bin", root,
+                                               (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind, l.wb, l.hb,
+                                               (int)l.block_height_log2);
+                            else snprintf(bp, sizeof bp, "build/tex/bcblk_%llx_L%u_%ux%u_k%d.wb%u_hb%u_bh%d.bin",
+                                          (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind, l.wb, l.hb,
+                                          (int)l.block_height_log2);
+                            if (!root) mkdir("build/tex", 0755);
+                            FILE *bf = fopen(bp, "wb");
+                            if (bf) { fwrite(blocks, 1, (size_t)nblocks, bf); fclose(bf); nb++; }
+                        }
+                    }
+                }
+                if (b->bc_astc) {
+                    size_t need = (size_t)l.wb * l.hb * 16u;
+                    VkSpan s = vk_transient(need, 16);
+                    int rc = astc_rt_encode_bc(blocks, l.w, l.h, b->bc_kind, b->bc_srgb != 0, s.ptr, need);
+                    free(blocks);
+                    if (rc == 0) {
+                        VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = 0, .bufferImageHeight = 0,
+                                                .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
+                                                .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv),
+                                                                l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
+                        vk_dl_note_upload((void *)b->image, rg.imageExtent.width, rg.imageExtent.height,
+                                          rg.imageSubresource.mipLevel);
+                        vkCmdCopyBufferToImage(cb, s.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &rg);
+                    }
+                    continue;
+                }
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 bc_decode_ldr(blocks, l.w, l.h, b->bc_kind, b->bc_srgb != 0, s.ptr);
-                free(blocks);
-                {  // 诊断：BC 解码结果统计 + 前 4 张 dump 成 RGBA8（build/tex/bc_*.rgba），判断解码是否有效
+                {  // 诊断：BC 解码结果统计 + dump（默认只前 8 条 / 前 4 张，可用环境变量放开）
+                    //   LARECOMP_BC_LOG_MAX=<n>   [bc] 日志条数上限（默认 8；0 表示不限）
+                    //   LARECOMP_BC_DUMP=<n>      dump 张数上限（默认 4；0 表示不限）
+                    //   LARECOMP_BC_DUMP_MIN_PX=<n> 只 dump 像素数 >= n 的纹理（默认 0）
+                    static int log_max = -2, dump_max = -2, dump_min_px = -2;
+                    if (log_max == -2) {
+                        log_max = getenv("LARECOMP_BC_LOG_MAX") ? atoi(getenv("LARECOMP_BC_LOG_MAX")) : 8;
+                        if (!log_max) log_max = 1 << 30;
+                        dump_max = getenv("LARECOMP_BC_DUMP") ? atoi(getenv("LARECOMP_BC_DUMP")) : 4;
+                        if (!dump_max) dump_max = 1 << 30;
+                        dump_min_px = getenv("LARECOMP_BC_DUMP_MIN_PX") ? atoi(getenv("LARECOMP_BC_DUMP_MIN_PX")) : 0;
+                    }
                     static int bc_n, bc_dumped;
                     static uint64_t bc_nonzero;
                     uint64_t npx = (uint64_t)l.w * l.h;
                     const uint8_t *pp = (const uint8_t *)s.ptr;
                     for (uint64_t i = 0; i < npx; i++)
                         if (pp[i * 4] | pp[i * 4 + 1] | pp[i * 4 + 2]) bc_nonzero++;
-                    if (bc_n < 8) {
-                        LOG("[bc] kind=%d %ux%u px=%llu nonzero=%llu\n", (int)b->bc_kind, l.w, l.h,
-                            (unsigned long long)npx, (unsigned long long)bc_nonzero);
+                    if (bc_n < log_max) {
+                        LOG("[bc] kind=%d %ux%u px=%llu nonzero=%llu lv=%u bl=%u bh_log2=%u fmt=%#x addr=%llx\n",
+                            (int)b->bc_kind, l.w, l.h, (unsigned long long)npx, (unsigned long long)bc_nonzero,
+                            lv, (uint32_t)bs, l.block_height_log2, t->format, (unsigned long long)t->addr);
                         bc_n++;
                     }
-                    if (bc_dumped < 4 && lv == 0 && layer == 0) {
-                        mkdir("build/tex", 0755);
-                        char bp[200];
-                        snprintf(bp, sizeof bp, "build/tex/bc_%llx_%ux%u_k%d.rgba", (unsigned long long)t->addr, l.w, l.h, (int)b->bc_kind);
+                    static int dump_mips2 = -1;
+                    if (dump_mips2 < 0) dump_mips2 = getenv("LARECOMP_BC_DUMP_MIPS") ? 1 : 0;
+                    if (bc_dumped < dump_max && (lv == 0 || dump_mips2) && layer == 0 && npx >= (uint64_t)dump_min_px) {
+                        const char *root = getenv("LARECOMP_DATA_ROOT");
+                        char bp[400];
+                        if (root) snprintf(bp, sizeof bp, "%s/bc_%llx_L%u_%ux%u_k%d.rgba", root,
+                                           (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind);
+                        else snprintf(bp, sizeof bp, "build/tex/bc_%llx_L%u_%ux%u_k%d.rgba",
+                                      (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind);
+                        if (!root) mkdir("build/tex", 0755);
                         FILE *bf = fopen(bp, "wb");
                         if (bf) { fwrite(pp, 1, (size_t)npx * 4, bf); fclose(bf); bc_dumped++; }
+                        // ★ 决定性诊断：同时 dump「反 swizzle 前的原始 guest 块表」，用来区分
+                        //   「swizzle 解错」还是「解码/上传错」。只有 LARECOMP_BC_DUMP_RAW=1 时才写。
+                        static int dump_raw = -1;
+                        if (dump_raw < 0) dump_raw = getenv("LARECOMP_BC_DUMP_RAW") ? 1 : 0;
+                        if (dump_raw) {
+                            char rp[400];
+                            if (root) snprintf(rp, sizeof rp, "%s/bcraw_%llx_L%u_%ux%u_k%d.bin", root,
+                                               (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind);
+                            else snprintf(rp, sizeof rp, "build/tex/bcraw_%llx_L%u_%ux%u_k%d.bin",
+                                          (unsigned long long)t->addr, lv, l.w, l.h, (int)b->bc_kind);
+                            // blocks 已经 free，这里重新按同样方式取一份（只在启用诊断时开销）
+                            const uint8_t *src2 = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
+                            FILE *rf = fopen(rp, "wb");
+                            if (rf) { fwrite(src2, 1, (size_t)nblocks, rf); fclose(rf); }
+                        }
                     }
                 }
+                free(blocks);
                 VkBufferImageCopy rg = {.bufferOffset = s.off, .bufferRowLength = l.w, .bufferImageHeight = l.h,
                                         .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, lv, layer, 1},
                                         .imageExtent = {l.w < level_w(b, lv) ? l.w : level_w(b, lv), l.h < level_h(b, lv) ? l.h : level_h(b, lv), 1}};
@@ -718,9 +898,19 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             }
             if (b->astc_bw) {  // blocks -> linear block rows -> RGBA8 texels
                 const uint8_t *src = (const uint8_t *)(uintptr_t)t->addr + layer * layer_size + l.offset;
-                uint8_t *blocks = malloc((uint64_t)l.wb * l.hb * 16);
-                if (linear) for (uint32_t y = 0; y < l.hb; y++) memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * t->stride, l.wb * 16);
-                else tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2);
+                uint64_t nbytes = (uint64_t)l.wb * l.hb * 16;
+                if (!t->addr || t->addr < GUEST_LO || t->addr + layer * layer_size + l.offset + nbytes > GUEST_HI) continue;
+                uint8_t *blocks = malloc(nbytes);
+                if (!blocks) { LOG("[astc] scratch malloc failed (%llu bytes), level skipped\n", (unsigned long long)nbytes); continue; }
+                if (linear) {
+                    // 同 BC 分支：guest 行距优先用 t->stride，未设置（0）时按块行字节数 wb*16 紧凑排列
+                    uint64_t src_pitch = t->stride ? t->stride : (uint64_t)l.wb * 16;
+                    for (uint32_t y = 0; y < l.hb; y++)
+                        memcpy(blocks + (uint64_t)y * l.wb * 16, src + (uint64_t)y * src_pitch, l.wb * 16);
+                } else {
+                    tegra_deswizzle(src, blocks, l.wb, l.hb, 1, 16, l.block_height_log2, l.block_depth_log2,
+                                    t->layout.packaged_width_log2);
+                }
                 VkSpan s = vk_transient((uint64_t)l.w * l.h * 4, 16);
                 astc_decode_ldr(blocks, l.w, l.h, b->astc_bw, b->astc_bh, b->astc_srgb, s.ptr);
                 free(blocks);
@@ -741,7 +931,8 @@ static void upload_texture(NvnTexture *t, TexBackend *b) {
             if (linear) {
                 for (uint32_t y = 0; y < l.hb; y++) memcpy(lin + (uint64_t)y * row, src + (uint64_t)y * t->stride, row);
             } else {
-                tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2);
+                tegra_deswizzle(src, lin, l.wb, l.hb, l.d, fi->bpb, l.block_height_log2, l.block_depth_log2,
+                                t->layout.packaged_width_log2);
             }
             static int dump_fmt = -2;  // LARECOMP_DUMP_TEX_FMT=<nvn format>: level 0 of those textures, untiled -> build/tex/
             if (dump_fmt == -2) dump_fmt = getenv("LARECOMP_DUMP_TEX_FMT") ? (int)strtol(getenv("LARECOMP_DUMP_TEX_FMT"), NULL, 0) : -1;
@@ -926,6 +1117,29 @@ static const VkComponentMapping IDENTITY = {VK_COMPONENT_SWIZZLE_IDENTITY, VK_CO
 
 // render: attachment view (one level, one layer). Otherwise a sampled view of type want_textype (TEXTYPE_*),
 // with the NVN component swizzle, converting between compatible types the way renderer.m does.
+// A BC texture stored as ASTC 4x4 cannot be viewed as RGBA8 (the NVN texture views the UI atlases use).
+// Rebuild it as RGBA8 the first time such a view is asked for; keeps the ASTC fast path for textures
+// the game never views.
+static void astc_demote(NvnTexture *t, TexBackend *b) {
+    if (!b->bc_astc) return;
+    {   // ★ v6b 诊断：ASTC 图集被 RGBA8 view 请求降级（UI 图集必然触发，是最关键的一条）
+        static int nlog, log_max = -2;
+        if (log_max == -2) log_max = getenv("LARECOMP_ASTC_LOG") ? 1 << 30 : 20;
+        if (nlog++ < log_max)
+            LOG("[astc-demote] nvn=%#x %ux%u bck=%d srgb=%d -> rebuild RGBA8 (a RGBA8 texture view was requested)\n",
+                t ? t->format : 0, t ? t->width : 0, t ? t->height : 0, (int)b->bc_kind, (int)b->bc_srgb);
+    }
+    destroy_image(b);
+    b->bc_astc = 0;
+    b->bc_no_astc = 1;
+    b->uploaded = false;
+    b->data_hash = 0;
+    b->sample_hash = 0;
+    b->checked_frame = 0;
+    create_image(t, b);
+    upload_texture(t, b);
+}
+
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype) {
     TexBackend *b = vk_tex(t, render);
     if (!has_view) v = NULL;
@@ -933,6 +1147,10 @@ VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool 
     if (v && (v->setmask & 4) && !(b->aspect & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
         VkFormat vf = fmt_of(v->format).vf;
         if (vk_format(t->format) == b->format) fmt = vf;  // (fallback images keep their own format)
+    }
+    if (b->bc_astc && fmt != VK_FORMAT_ASTC_4x4_UNORM_BLOCK && fmt != VK_FORMAT_ASTC_4x4_SRGB_BLOCK) {
+        astc_demote(t, b);
+        fmt = b->format;
     }
     uint32_t lv0 = v && (v->setmask & 1) ? v->base_level : 0;
     uint32_t nlv = v && (v->setmask & 1) && v->num_levels ? v->num_levels : b->levels - (lv0 < b->levels ? lv0 : 0);

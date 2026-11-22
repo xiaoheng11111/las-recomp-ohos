@@ -583,7 +583,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
         break;
     case 7: {  // GetEntryType
         struct stat sb;
-        if (stat(p, &sb)) { resp->result = FS_PATH_NOT_FOUND; break; }
+        if (stat(p, &sb)) { LOG("[fs] GetEntryType NOT FOUND: %s\n", p); resp->result = FS_PATH_NOT_FOUND; break; }
         OUT(uint32_t, 0) = S_ISDIR(sb.st_mode) ? 0 : 1;
         resp_size(resp, 4);
         break;
@@ -591,7 +591,7 @@ static void filesystem(Service *s, IpcReq *req, IpcResp *resp) {
     case 8: {  // OpenFile(mode)
         uint32_t mode = IN(uint32_t, 0);
         int fd = open(p, (mode & 2) ? O_RDWR : O_RDONLY);
-        if (fd < 0) { resp->result = errno_result(); break; }
+        if (fd < 0) { LOG("[fs] OpenFile FAILED: %s (errno=%d)\n", p, errno); resp->result = errno_result(); break; }
         HostFile *f = calloc(1, sizeof *f);
         f->fd = fd;
         strlcpy(f->path, p, sizeof f->path);

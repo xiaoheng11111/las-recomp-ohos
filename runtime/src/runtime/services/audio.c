@@ -939,7 +939,14 @@ static void renderer_open_output(Renderer *r) {
     }
     if (getenv("LARECOMP_NO_AUDIO") && strcmp(getenv("LARECOMP_NO_AUDIO"), "0")) return;
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) { LOG("[audren] SDL audio init failed: %s\n", SDL_GetError()); return; }
-    SDL_AudioSpec spec = {SDL_AUDIO_F32, 2, (int)r->sample_rate};
+    // 必须用指定字段初始化：shim 的 SDL_AudioSpec 声明为
+    //   { SDL_AudioDeviceID freq_dummy; int freq; int channels; int format; }
+    // 用位置初始化 {format, channels, freq} 会整体错位（freq=声道数、channels=采样率、format=0），
+    // 导致送进声卡的数据被当成 0 声道 / 未知格式 → 无声。
+    SDL_AudioSpec spec = {0};
+    spec.freq = (int)r->sample_rate;
+    spec.channels = 2;
+    spec.format = SDL_AUDIO_F32;
     r->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
     if (!r->stream) { LOG("[audren] SDL audio open failed: %s\n", SDL_GetError()); return; }
     if (getenv("LARECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(r->stream, (float)atof(getenv("LARECOMP_AUDIO_GAIN")));
@@ -1247,7 +1254,11 @@ SERVICE("audout:u", audout_u) {
             a->wav = fopen(path, "wb");
         }
         if (!(getenv("LARECOMP_NO_AUDIO") && strcmp(getenv("LARECOMP_NO_AUDIO"), "0")) && SDL_InitSubSystem(SDL_INIT_AUDIO)) {
-            SDL_AudioSpec spec = {SDL_AUDIO_S16, (int)a->channels, (int)a->rate};
+            // 同上：必须用指定字段初始化，位置初始化会错位导致无声
+            SDL_AudioSpec spec = {0};
+            spec.freq = (int)a->rate;
+            spec.channels = (int)a->channels;
+            spec.format = SDL_AUDIO_S16;
             a->stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, NULL, NULL);
             if (a->stream) {
                 if (getenv("LARECOMP_AUDIO_GAIN")) SDL_SetAudioStreamGain(a->stream, (float)atof(getenv("LARECOMP_AUDIO_GAIN")));

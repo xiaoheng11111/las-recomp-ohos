@@ -68,6 +68,21 @@ void bc_decode_block(const uint8_t *block, int kind, uint8_t *out) {
         bc1_indices(out, block + 4, pal);
         return;
     }
+    if (kind == 2) {
+        // BC2/DXT3 的块布局是「8 字节显式 4-bit alpha + 8 字节 BC1 风格颜色」，
+        // 与 BC3 的「8 字节插值 alpha + 8 字节颜色」位置完全相同，但 alpha 语义不同：
+        //   block[0..7]  = 16 个 4-bit alpha（每字节低半字节在前），展开 a = 15*nib*17 即 x17
+        //   block[8..15] = c0/c1 (4 字节) + 2-bit 索引 (4 字节)
+        // ★ 曾经的 bug：把颜色读成 block[0..7]、alpha 读成 block[8..15] —— 两者完全交换，
+        //   结果 RGB 由 alpha 数据解出（大量纯黑），alpha 由颜色数据解出，整张图花屏。
+        uint8_t pal[4][4];
+        bc1_block_colors(block + 8, pal);          // 颜色在 block[8..11]
+        bc1_indices(out, block + 12, pal);         // 索引在 block[12..15]
+        uint64_t abits = 0;
+        for (int i = 0; i < 8; i++) abits |= (uint64_t)block[i] << (8 * i);   // alpha 在 block[0..7]
+        for (int i = 0; i < 16; i++) out[i * 4 + 3] = (uint8_t)(((abits >> (4 * i)) & 0xF) * 17);
+        return;
+    }
     if (kind == 3) {
         uint8_t alpha[16];
         bc4_block_alpha(block, alpha);

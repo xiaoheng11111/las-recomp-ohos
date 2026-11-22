@@ -296,6 +296,11 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
         static int nlog;
         if (nlog++ < 20) LOG("[shader] %s: GLSL compile failed:\n%s\n%s\n", name, shaderc_result_get_error_message(r), effective_src);
+        // OHOS 诊断：统计失败总数，避免「失败被静默跳过 → 只剩清屏色」无从察觉
+        static int nfail;
+        nfail++;
+        if (nfail <= 3) LOG("[shader] COMPILE-FAIL #%d name=%s stage=%d\n", nfail, name, stage);
+        else if ((nfail % 16) == 0) LOG("[shader] COMPILE-FAIL total=%d (最新 %s)\n", nfail, name);
     } else {
         size_t n = shaderc_result_get_length(r);
         out = malloc(n);
