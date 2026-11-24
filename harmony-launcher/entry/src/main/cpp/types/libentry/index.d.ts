@@ -34,3 +34,8 @@ export const getFps: () => string;
 export const pollSwkbd: () => string;
 /** 提交软键盘输入（text 为空/ok=0 表示取消）。 */
 export const submitSwkbd: (text: string, ok: number) => boolean;
+
+/** 数据采集：开始录制（0=已开始，-2=已在录，-1=无数据根，-3=运行时未加载）。 */
+export const startCollect: () => number;
+/** 数据采集：停止录制，返回摘要文本。 */
+export const stopCollect: () => string;

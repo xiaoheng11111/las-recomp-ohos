@@ -17,6 +17,7 @@
 #include "../../kernel.h"
 #include "shaders.h"
 #include "vk.h"
+#include "../bc.h"       // bc_decode_ldr: BC 纹理的 buffer -> image 拷贝要走 CPU 解码（无 BC 支持的移动 GPU）
 #include "../renderer.h"
 // Forward declaration for hmix (defined as static later)
 static uint64_t hmix(uint64_t h, const void *p, size_t n);
@@ -38,6 +39,102 @@ static uint64_t stat_upload_bytes;
 // sets = descriptor sets incl. cbuf copies, vtx = index scan + vertex copies, submit = vkQueueSubmit2)
 static int prof = -1;
 static uint64_t prof_exec, prof_draw, prof_sets, prof_vtx, prof_submit, prof_pre, prof_key, prof_dyn, prof_tex, prof_up, prof_gpu;
+// v9 诊断拆分（只为定位瓶颈，不改变任何行为）：
+//   prof_sets_alloc / prof_sets_upd —— 把 sets 时间拆成「vkAllocateDescriptorSets」与「vkUpdateDescriptorSets」。
+//     室外重场景 sets 约占每帧 CPU 11ms（600+ draw × 每 draw 2 个描述符集），
+//     必须知道是「分配」贵还是「写入」贵，才能决定走 push descriptor（免分配）还是做描述符集缓存。
+//   prof_vtx_copy / prof_vtx_bind —— 把 vtx 时间拆成「顶点/索引数据拷贝（memcpy）」与「vkCmdBindVertexBuffers 绑定调用」。
+//
+// ★ v13 新增：把 prof_draw（每帧 20~23ms，占 CPU 80~88%）拆成 4 个分项 ★
+//   为什么要拆：perf-optimizer2 的数据确认 cpu_draw_ms 是唯一瓶颈，
+//   但不知道这 20ms 到底花在「驱动调用本身」还是「冗余绑定」还是「状态切换」。
+//   这四个分项的边界（都在 draw_() 内部）：
+//     prof_cmd_draw   —— vkCmdDraw / vkCmdDrawIndexed 这两个调用本身
+//     prof_bind       —— vkCmdBindIndexBuffer + vkCmdBindVertexBuffers
+//     prof_desc_bind  —— vkCmdBindDescriptorSets（图形管线那次，draw_() 里的 0..2 sets）
+//     prof_state      —— vkCmdBindPipeline + SetViewport/Scissor + PushConstants + 各种 Set*
+//   注意：这四项加起来【不等于】prof_draw，因为 prof_draw 还包含
+//   索引扫描、顶点范围计算、vtx 拷贝等业务逻辑（那些已有 prof_vtx_copy 等单独统计）。
+//   所以分析时要看「四项之和 / prof_draw」的占比，差额就是业务逻辑开销。
+static uint64_t prof_cmd_draw, prof_bind, prof_desc_bind, prof_state;
+
+// ==========================================================================
+// ★ v16 诊断：把 prof_vtx（每帧 4.12ms，占 cpu_draw 23%）再拆 3 层 ★
+// --------------------------------------------------------------------------
+// 【为什么要拆】
+//   v15 实测：cpu_vtx_ms 每帧 4.12ms，其中 vtx_copy 1.37ms + vtx_bind 0.05ms，
+//   还有 2.70ms（65.7%）去向不明。而这 2.70ms 里混着三件性质完全不同的事：
+//
+//     (a) vtx_scan  —— scan_max_index()：扫描索引求最大值（决定要拷多少顶点）
+//         ★ 真机（Kirin9030Pro / aarch64）没有 SIMD 分支，只能跑标量 O(n) 循环
+//           （exec.c:525-545 里只有 __x86_64__ 的 AVX2 分支）。
+//           源码注释实测：x86 标量 1.4us/draw，AVX2 0.15us/draw（9.3x）。
+//           ★ 这是【可以用 NEON 优化】的目标。
+//
+//     (b) vtx_expand —— 8bit→16bit 索引加宽循环（exec.c:3827-3835）
+//         也是逐元素循环 + 顺便算 max_index，ARM64 同样没 SIMD。
+//           ★ 同样【可以用 NEON 优化】。
+//
+//     (c) vtx_idx   —— 整个索引处理块的合计（含上面两项 + vk_transient 分配）
+//         用来回答「2.70ms 里到底有多少是 (a)+(b)」。
+//
+// 【为什么必须区分 (a)(b) 和别的】
+//   如果 2.70ms 大部分是 (a)(b) 的标量循环 => 写 NEON 值得（纯计算，零行为风险）
+//   如果大部分是 vk_transient 分配或别的东西 => 写 NEON 白干
+//   ★ 不先量清楚就写 NEON，等于赌；这轮我们已经因为「拍脑袋估收益」错过两次。
+//
+// 【子项关系（分析时勿相加）】
+//   vtx_scan 和 vtx_expand 都是 vtx_idx 的【子集】：
+//     vtx_idx = 整个索引处理块
+//     vtx_scan ⊂ vtx_idx, vtx_expand ⊂ vtx_idx
+//   所以分析时：vtx_idx - vtx_scan - vtx_expand = 索引块里除这两项外的开销。
+//
+// 【计时点必须在 for 循环外面】
+//   SDL_GetTicksNS() 在 ARM64 上是 clock_gettime，约 20~30ns。
+//   每 draw 多 3 次 = 90ns × 321 draws/帧 ≈ 0.029ms/帧，可忽略。
+//   但如果插到最内层循环里（比如 expand 的 for 内），就会暴增 —— 绝不允许。
+// ==========================================================================
+static uint64_t prof_vtx_idx;     // 索引处理块合计（L3791 起，到索引块结束）
+static uint64_t prof_vtx_scan;    // 只包 scan_max_index() 调用（vtx_idx 的子集）
+static uint64_t prof_vtx_expand;  // 只包 8bit→16bit 展开循环（vtx_idx 的子集）
+
+
+// ==========================================================================
+// ★ v14 诊断：串行度定位计数（纯计数，不改变任何行为）★
+// --------------------------------------------------------------------------
+// 【为什么要加这 10 个】
+//   v13 采集实测：in_flight_max 稳态恒为 1（62/63 窗口，仅启动期 t=526 出现过 2），
+//   而且 in_flight_end 是 63/63 全部 = 1（不只是峰值低，是稳态就是 1）。
+//   cpu_exec 492ms/秒 + gpu 596ms/秒 = 1088ms = 108.9% > 100% -> GPU/CPU 完全串行排队。
+//   若并行，理论帧时长 = max(18.7, 22.7) = 22.7ms -> 43.9 fps（现在只有 26.2）。
+//   这是唯一能到用户目标（40-50fps）的方向。
+//
+// 【但必须先回答「能不能改」，否则收益评估是空谈】
+//   串行可能来自三个源，可行性完全不同：
+//     (a) nvnQueueFinish  —— 游戏主动调用，是 NVN 契约（队列清空），【不能改】
+//         改了会违反 API 语义，游戏可能读到未完成的 GPU 结果 -> 逻辑错乱
+//     (b) renderer_sync   —— 我们内部的硬同步（等价 vkQueueWaitIdle），【可能可改】
+//     (c) renderer_flush  —— 我们内部的「提交后立刻等最新」，【可能可改】
+//   这 10 个计数就是用来分辨「到底是哪一个在造成串行」。
+//
+// 【等待深度 back 是关键判据】
+//   back = submit_seq - seq（被等的 seq 落后当前最新提交多远）
+//     back 0~1  -> 在等最新或上一帧 = 并行被排空（串行）
+//     back 2    -> 双缓冲正常工作
+//     back >= 3 -> 三缓冲正常工作（FRAMES=3 的理想状态）
+//
+// 【计数器归属（与 data-collector 商定）】
+//   定义在 las_collect.c（L667-672，g_ 前缀，普通 uint64_t 非原子），
+//   exec.c / objects.c 用 extern 引用累加。
+//   为什么用普通 uint64_t 不用 _Atomic：这些只在渲染线程单线程累加、采集器读取。
+//   读取最坏读到近似值，对统计判断无影响。而 _Atomic 的 ++ 在热路径
+//   （vk_wait_seq 每次等 fence 都走）会从 ~1ns 涨到 ~15ns，不值得。
+//   采用【函数内局部 extern】而不是文件级 extern，是为了把「谁在用」标在调用点旁，
+//   避免以后误删/误改时找不到引用方。
+// ==========================================================================
+
+//     本机 VK_EXT_external_memory_host 不可用，顶点只能每帧拷贝；先量清楚哪一半更贵。
+static uint64_t prof_sets_alloc, prof_sets_upd, prof_vtx_copy, prof_vtx_bind;
 static VkQueryPool prof_qp;
 static uint64_t cum_exec, cum_wait, cum_draws, cum_submits;  // (profiling) never reset: hitch log
 static uint32_t prof_end_line[4096];  // passes ended, by the exec.c line that ended them (0: submit / present)
@@ -85,14 +182,100 @@ uint64_t vk_completed_seq(void) {
     return v;
 }
 
-void vk_wait_seq(uint64_t seq) {
+uint64_t vk_submitted_seq(void) {
+    pthread_mutex_lock(&seq_lock);
+    uint64_t s = submit_seq;
+    pthread_mutex_unlock(&seq_lock);
+    return s;
+}
+
+// ★ v17.1：上一个统计窗口的每帧 GPU 忙碌时间（ms）；-1 = 还没有样本。
+//   给 output_scale.c 的动态分辨率用：-1 时它走原来的"盲探针"升档，不会误判。
+//   注意它不是"本帧"GPU 时间，而是最近 1 秒的平均 —— 动态分辨率本来就是每 0.5 秒决策一次。
+static double g_last_gpu_ms_frame = -1.0;
+double renderer_last_gpu_ms(void) { return g_last_gpu_ms_frame; }
+
+// ★ v17：真实的在飞帧数 = 已提交 − timeline 已完成。这是唯一无结构性偏差的口径。
+//   v13 的 in_flight 是「提交+1 / 等待成功-1」，每帧一加一减，结构上恒为 1（见度量审查文档）。
+int vk_inflight_true(void) {
+    uint64_t s = vk_submitted_seq();
+    uint64_t c = vk_completed_seq();
+    return (s > c) ? (int)(s - c) : 0;
+}
+
+// ★ v17：按调用站点归因的等待统计（由 las_collect 读走并清零）。
+//   目的：下一次真机数据能直接点名「谁在等」，而不是靠推理。
+uint64_t g_vk_wait_site_cnt[VK_WAIT_SITE_COUNT];
+uint64_t g_vk_wait_site_ns[VK_WAIT_SITE_COUNT];
+uint64_t g_vk_wait_nosub_cnt;   // 请求了尚未提交的 seq 的次数（= 游戏/录制跑在 GPU 前面）
+
+void vk_wait_seq_at(uint64_t seq, VkWaitSite site) {
     if (!seq) return;
+    // ★ v14 诊断：记录这次等待的「落后深度 back」= submit_seq - seq。
+    //   为什么在 vk_wait_seq 这里算：它是所有等待的唯一入口（renderer_flush /
+    //   renderer_sync / renderer_wait_seq / sub() 的 slot 复用都走它），
+    //   所以在这里统计能保证不漏。
+    //
+    //   【back 的语义】（与 data-collector 统一口径）
+    //     submit_seq = 已提交的最后一个 submission 号
+    //     seq        = 这次要等的那个 submission 号
+    //     back 0~1  -> 等的是最新或上一帧（并行被排空 = 串行）
+    //     back 2    -> 双缓冲正常工作
+    //     back >= 3 -> 三缓冲正常工作（FRAMES=3 的理想状态）
+    //
+    //   注意：submit_seq 是 exec.c:99 的 static，与 vk_wait_seq 同文件可见。
+    //   seq==0 是「没提交」的哨兵，已在上面 return，不会计到这里。
+    uint64_t cur = vk_submitted_seq();
+    if (seq > cur) {
+        // ★ v17：请求了一个尚未提交的 submission（游戏/渲染线程跑在 GPU 前面）。
+        //   旧版在这里 clamp 成 submit_seq 后记 back=0，把「等未来帧」误记成「等最新帧」——
+        //   这正是 v15 wait_dist 失真的根源（renderer_wait_seq 的 clamp 在调用方）。
+        //   行为不变（仍然只等已提交的），但单独计数，不再污染 wait_dist。
+        g_vk_wait_nosub_cnt++;
+        seq = cur;                 // behaviour unchanged: everything submitted so far
+        if (!seq) return;
+    }
+    {
+        extern uint64_t g_wait_dist_1, g_wait_dist_2, g_wait_dist_3, g_wait_dist_4plus;
+        extern uint64_t g_wait_dist_max, g_vk_wait_total_cnt;
+        uint64_t back = cur - seq;
+        if (back <= 1)         g_wait_dist_1++;
+        else if (back == 2)    g_wait_dist_2++;
+        else if (back == 3)    g_wait_dist_3++;
+        else                   g_wait_dist_4plus++;
+        if (back > g_wait_dist_max) g_wait_dist_max = back;
+        g_vk_wait_total_cnt++;
+    }
     VkSemaphoreWaitInfo wi = {.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, .semaphoreCount = 1, .pSemaphores = &g_vk.timeline,
                               .pValues = &seq};
     uint64_t t0 = SDL_GetTicksNS();
     VkResult r = vkWaitSemaphores(g_vk.dev, &wi, 10ull * 1000000000ull);
     stat_wait_ns += SDL_GetTicksNS() - t0;
     cum_wait += SDL_GetTicksNS() - t0;
+    // ★ v13 采集：把这次 fence 等待的时间【另外累加一份】给采集器。
+    //   【为什么不能直接用上面的 stat_wait_ns】
+    //     1) stat_wait_ns 会在 renderer_stats() 里被清零（exec.c 第 811 行），
+    //        而采集器的 hook 在 renderer_stats() 第一句 —— 如果两边共用同一个变量，
+    //        采集器读完之后文本日志那边就拿到 0，会破坏既有日志。
+    //     2) 采集器要的是「本统计窗口内所有 vkWaitSemaphores 的总阻塞」，
+    //        口径虽相同，但生命周期必须独立，才能保证互不干扰。
+    //   所以用一个独立累加器 las_fence_ns（定义在 device.c），由采集器读走并清零。
+    //   【判据】fence_wait_ms 大 => CPU 提交完在干等 GPU => 双缓冲/并行没生效。
+    {
+        extern _Atomic uint64_t las_fence_ns;
+        atomic_fetch_add(&las_fence_ns, SDL_GetTicksNS() - t0);
+    }
+    // ★ v17：按站点归因（哪个调用点在等、等了多久）。
+    if ((unsigned)site < (unsigned)VK_WAIT_SITE_COUNT) {
+        g_vk_wait_site_cnt[site]++;
+        g_vk_wait_site_ns[site] += SDL_GetTicksNS() - t0;
+    }
+    // ★ v13 采集：这次等待成功，说明至少有一帧的 GPU 工作做完了，在飞帧 -1。
+    //   超时/设备丢失不算完成，不减（否则 in_flight 会漂移到负数）。
+    if (r == VK_SUCCESS) {
+        extern void las_vkstat_on_complete(void);
+        las_vkstat_on_complete();
+    }
     if (r == VK_TIMEOUT) LOG("[vk] GPU did not finish submission %llu within 10 s (device lost?)\n", (unsigned long long)seq);
     else if (r != VK_SUCCESS) {
         extern void vk_devlost_dump(void);
@@ -104,10 +287,13 @@ void vk_wait_seq(uint64_t seq) {
 
 uint64_t vk_pending_seq(void) { return submit_seq + 1; }
 
+// ★ v17：保持旧签名可用；未指定站点的一律记为 DEFAULT。
+void vk_wait_seq(uint64_t seq) { vk_wait_seq_at(seq, VK_WAIT_SITE_DEFAULT); }
+
 static Sub *sub(void) {
     Sub *s = &subs[cur_sub];
     if (s->seq != submit_seq + 1) {  // slot reused: its previous submission must be done
-        vk_wait_seq(s->seq);
+        vk_wait_seq_at(s->seq, VK_WAIT_SITE_SUB);
         if (s->ts) {  // (profiling) GPU time of that submission
             uint64_t t[2];
             if (vkGetQueryPoolResults(g_vk.dev, prof_qp, (uint32_t)cur_sub * 2, 2, sizeof t, t, 8, VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && t[1] > t[0])
@@ -311,15 +497,32 @@ void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra
 void renderer_submit(void) { vk_submit_extra(VK_NULL_HANDLE, VK_NULL_HANDLE, VK_NULL_HANDLE); }
 
 void renderer_flush(void) {
+    // ★ v14 诊断：统计 renderer_flush 调用次数。
+    //   为什么重要：这个函数是「提交后立刻等最新」（见下面 vk_wait_seq(submit_seq)），
+    //   是造成 GPU/CPU 串行的头号嫌疑。如果它每帧被调一次，就说明我们内部在把并行排空。
+    //   已核实：renderer_sync 内部【不】调用本函数，两个计数各自独立，不会重复计数。
+    {
+        extern uint64_t g_renderer_flush_cnt;
+        g_renderer_flush_cnt++;
+    }
     renderer_submit();
-    vk_wait_seq(submit_seq);
+    vk_wait_seq_at(submit_seq, VK_WAIT_SITE_FLUSH);
 }
 
 void renderer_sync(void) {
+    // ★ v14 诊断：统计 renderer_sync 调用次数。
+    //   它是「等全部提交完成」的硬同步（等价 vkQueueWaitIdle）。
+    //   objects.c:120 的 nvnQueueFinish 会调它，所以恒有 nvn_queue_finish_cnt <= 本计数。
+    //   判据：若 nvn_queue_finish_cnt 低但本计数高 -> 是我们内部别处调的，可能能改。
+    //   已核实：本函数内部【不】调用 renderer_flush，两个计数各自独立。
+    {
+        extern uint64_t g_renderer_sync_cnt;
+        g_renderer_sync_cnt++;
+    }
     pthread_mutex_lock(&seq_lock);
     uint64_t s = submit_seq;
     pthread_mutex_unlock(&seq_lock);
-    vk_wait_seq(s);
+    vk_wait_seq_at(s, VK_WAIT_SITE_SYNC);
 }
 
 uint64_t renderer_fence_seq(void) {
@@ -335,14 +538,20 @@ uint64_t renderer_fence_seq(void) {
 
 void renderer_wait_seq(uint64_t seq) {
     if (!seq) return;
-    pthread_mutex_lock(&seq_lock);
-    uint64_t s = submit_seq;
-    pthread_mutex_unlock(&seq_lock);
-    vk_wait_seq(seq > s ? s : seq);  // not submitted yet (other thread): everything submitted so far
+    // ★ v14 诊断：这个函数比 renderer_sync 温和（只等指定 seq，不是等全部提交）。
+    //   它的等待也会被 vk_wait_seq 统计算进 wait_dist_*，所以这里不需要额外计数。
+    //   （data-collector 的 9 列里没有单列 renderer_wait_seq_cnt，避免加列改表结构。）
+    // ★ v17：不再在这里 clamp —— 把「请求的原始 seq」交给 vk_wait_seq_at，
+    //   由它在内部 clamp 并单独统计 nosub。这样 wait_dist 才是真实落后深度。
+    //   （行为与旧版等价：旧版在这里 clamp 成 submit_seq，vk_wait_seq 内部再等同一个值。）
+    vk_wait_seq_at(seq, VK_WAIT_SITE_FENCE);
 }
 
 VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
     Sub *s = sub();
+    // v9 诊断：单独计时「描述符集分配」。移动端驱动里 vkAllocateDescriptorSets 往往比 vkUpdateDescriptorSets 更贵，
+    // 若确实是分配占大头，后续就改成「一次批量分配多个 set」或 push descriptor（不分配）。
+    uint64_t ta_ = prof ? SDL_GetTicksNS() : 0;
     for (;;) {
         if (s->cur_pool == s->npools) {
             if (s->npools == 16) FATAL("descriptor pools exhausted\n");
@@ -357,7 +566,10 @@ VkDescriptorSet vk_alloc_set(VkDescriptorSetLayout layout) {
                                           .descriptorPool = s->pools[s->cur_pool], .descriptorSetCount = 1, .pSetLayouts = &layout};
         VkDescriptorSet set;
         VkResult r = vkAllocateDescriptorSets(g_vk.dev, &ai, &set);
-        if (r == VK_SUCCESS) return set;
+        if (r == VK_SUCCESS) {
+            if (prof) prof_sets_alloc += SDL_GetTicksNS() - ta_;
+            return set;
+        }
         s->cur_pool++;
     }
 }
@@ -764,7 +976,113 @@ static void save_pipeline_cache(void *a) {
     LOG("[vk] pipeline cache saved (%.0f ms)\n", (SDL_GetTicksNS() - t0) / 1e6);
 }
 
+// ============================================================================
+// 采集 hook 用到的外部符号（★ 新增，不改变任何既有逻辑）
+// ----------------------------------------------------------------------------
+// 为什么在文件级声明：下面 renderer_stats() 里的采集 hook 在【函数第一句】执行，
+// 而原代码里 prof_tex_* 这 5 个变量是在函数中部（原第 838 行）用局部 extern 取的，
+// 位置在 hook 之后，作用域里还没有它们。所以在文件级补一次声明。
+// 这 5 个变量的真实定义在 textures.c:539。
+// ⚠️ 原代码第 838 行那句局部 extern 保留不动（重复声明合法，且不动原代码最安全）。
+// ============================================================================
+extern uint64_t prof_tex_checks, prof_tex_samples, prof_tex_full, prof_tex_full_bytes, prof_tex_dyn;
+// renderer_present_count 的真实定义在 device.c:1332，原代码在 exec.c 第 977 行才声明它
+// （在那之前只有局部 extern）。采集 hook 在 renderer_stats() 第一句就要用它拿帧号，
+// 早于第 977 行，所以在文件级补一次声明。
+// ⚠️ 原第 977 行那句声明保留不动（重复声明合法）。
+extern uint64_t renderer_present_count(void);
+#include "las_collect.h"
+
 const char *renderer_stats(void) {
+    // ========================================================================
+    // ★★★ 游戏内采集：把本统计窗口的原始计数抄一份出去 ★★★
+    // ------------------------------------------------------------------------
+    // 【为什么必须放在函数第一句，以后谁想挪走先读完这段】
+    //   本函数会把每个计数器清零，而且清零动作【藏在 snprintf 的参数里】，看着像
+    //   只是打印，其实读的一瞬间就清掉了：
+    //       原第 799-805 行：snprintf(... atomic_exchange(&stat_compiles, 0),
+    //                              atomic_exchange(&stat_translate_ns, 0), ...)
+    //       原第 809 行：stat_vtx_copied = stat_vtx_direct = 0;
+    //       原第 811 行：stat_feedback_copies = stat_upload_bytes = ... = 0;
+    //       原第 829 行：memset(stat_skip_why, 0, ...)
+    //       原第 847 行：memset(prof_end_line, 0, ...)
+    //       原第 857/860 行：prof_* = 0; stat_draws = stat_skipped = ... = 0;
+    //   所以放到后面任何位置，拿到的都是「一半 0、一半真值」——
+    //   数据静默错误，比崩溃难查一百倍。
+    //
+    // 【为什么在采集器里直接读变量，而不是解析本函数返回的文本】
+    //   1) 文本里 gpu/cpu 都是 %.0f 取整，拿不到亚毫秒差异；
+    //   2) stats_text 是 static char[1024]，下次调用就被覆盖，不能延后解析；
+    //   3) 文本格式一改，所有解析脚本全崩。
+    //
+    // 【本 hook 的副作用】
+    //   只读、不清零、不写任何既有变量。未开始采集时 las_collect_on_stats()
+    //   第一句就 return（读一个 int 判断），开销约 1 纳秒。
+    //   出问题时把下面这段整体注释掉，就完全回到 v11，文本日志一字不差。
+    // ========================================================================
+    las_collect_on_stats(&(LasStats){
+        .frame          = renderer_present_count(),
+        .draws          = stat_draws,
+        .skipped        = stat_skipped,
+        .passes         = stat_passes,
+        .dispatches     = stat_dispatches,
+        .flushes        = stat_flushes,
+        .wait_ms        = stat_wait_ns / 1000000ULL,
+        .compile_n      = (uint64_t)atomic_load(&stat_compiles),
+        .translate_ms   = (double)atomic_load(&stat_translate_ns) / 1e6,
+        .spirv_ms       = (double)atomic_load(&stat_spirv_ns) / 1e6,
+        .pipelines_ms   = (double)atomic_load(&stat_pipe_ns) / 1e6,
+        .draws_waited_ms= (double)stat_shader_wait_ns / 1e6,
+        .fbcopy         = stat_feedback_copies,
+        .upload_mb      = (double)stat_upload_bytes / 1048576.0,
+        .vtx_copied     = stat_vtx_copied,
+        .vtx_inplace    = stat_vtx_direct,
+        .skip           = { stat_skip_why[0], stat_skip_why[1], stat_skip_why[2],
+                            stat_skip_why[3], stat_skip_why[4], stat_skip_why[5],
+                            stat_skip_why[6] },
+        .gpu_ms         = (double)prof_gpu / 1e6,
+        .cpu_exec_ms    = (double)prof_exec / 1e6,
+        .cpu_draw_ms    = (double)prof_draw / 1e6,
+        .cpu_pre_ms     = (double)prof_pre / 1e6,
+        .cpu_key_ms     = (double)prof_key / 1e6,
+        .cpu_dyn_ms     = (double)prof_dyn / 1e6,
+        .cpu_sets_ms    = (double)prof_sets / 1e6,
+        .cpu_tex_ms     = (double)prof_tex / 1e6,
+        .cpu_tex_upload_ms = (double)prof_up / 1e6,
+        .cpu_vtx_ms     = (double)prof_vtx / 1e6,
+        .submit_ms      = (double)prof_submit / 1e6,
+        .tex_checks     = prof_tex_checks,
+        .tex_samples    = prof_tex_samples,
+        .tex_full       = prof_tex_full,
+        .tex_full_mb    = (double)prof_tex_full_bytes / 1048576.0,
+        .tex_dyn        = prof_tex_dyn,
+        .views_created  = prof_views_created,
+        .sets_alloc_ms  = (double)prof_sets_alloc / 1e6,
+        .sets_upd_ms    = (double)prof_sets_upd / 1e6,
+        .vtx_copy_ms    = (double)prof_vtx_copy / 1e6,
+        .vtx_bind_ms    = (double)prof_vtx_bind / 1e6,
+        // ---- v16：cpu_vtx 的「其余」拆解（判定 NEON 到底值不值得写）----
+        //   【为什么需要】cpu_vtx 每帧约 4.20ms，但已知子项 vtx_copy(1.39) + vtx_bind(0.05)
+        //     只有 1.44ms，剩下约 2.76ms 不知道花在哪。
+        //     源码注释（本文件 scan_max_index 上方）实测：索引扫描标量 1.4us/draw，
+        //     即 327 draws/帧 × 1.4us ≈ 0.46ms/帧。所以「NEON 能省 2ms」是错的，
+        //     必须先量清楚这 2.76ms 是「扫描贵」还是「VMA 分配/索引展开贵」。
+        //   【三项覆盖】
+        //     vtx_idx    = 整个索引处理块（L3836 起，到索引块结束）
+        //     vtx_scan   = 只包 scan_max_index() 调用（NEON 优化的精确目标）
+        //     vtx_expand = 只包 8bit→16bit 展开循环
+        //   ★ 子项关系：vtx_scan ⊂ vtx_idx，vtx_expand ⊂ vtx_idx，分析时【勿相加】。
+        .vtx_idx_ms     = (double)prof_vtx_idx / 1e6,
+        .vtx_scan_ms    = (double)prof_vtx_scan / 1e6,
+        .vtx_expand_ms  = (double)prof_vtx_expand / 1e6,
+        // ---- v13 B 组：draw 内部 4 个分项 ----
+        .cmd_draw_ms    = (double)prof_cmd_draw / 1e6,
+        .bind_ms        = (double)prof_bind / 1e6,
+        .desc_bind_ms   = (double)prof_desc_bind / 1e6,
+        .state_ms       = (double)prof_state / 1e6,
+    }, prof_end_line, (int)(sizeof prof_end_line / sizeof prof_end_line[0]));
+    // ---- 采集 hook 结束，以下为 v11 原代码，一字不改 ----
+
     // The pipeline cache was written only at a clean exit: a crash or a killed process lost every pipeline built in
     // the session, and the next one popped in again. Save it on a worker once a burst of new pipelines settles
     // (no new ones for ~6 s: entering an area builds them for a few seconds).
@@ -834,8 +1152,28 @@ const char *renderer_stats(void) {
         n = strlen(stats_text);
         snprintf(stats_text + n, sizeof stats_text - n, " | views created %llu", (unsigned long long)prof_views_created);
         prof_views_created = 0;
+        // v9 诊断：把 sets/vtx 两个 CPU 大项再拆开（单位 ms，与前面各段同一统计窗口）
+        n = strlen(stats_text);
+        snprintf(stats_text + n, sizeof stats_text - n, " | split: sets分配 %.0f sets更新 %.0f vtx拷贝 %.0f vtx绑定 %.0f",
+                 prof_sets_alloc / 1e6, prof_sets_upd / 1e6, prof_vtx_copy / 1e6, prof_vtx_bind / 1e6);
+        prof_sets_alloc = prof_sets_upd = prof_vtx_copy = prof_vtx_bind = 0;
         prof_tex_checks = prof_tex_samples = prof_tex_full = prof_tex_full_bytes = prof_tex_dyn = 0;
         prof_exec = prof_draw = prof_sets = prof_vtx = prof_submit = prof_pre = prof_key = prof_dyn = prof_tex = prof_up = prof_gpu = 0;
+        // ★ v17.1：把上一个统计窗口的「每帧 GPU 忙碌时间」留下来，供动态分辨率使用。
+        //   为什么必须在这里（清零之前）：prof_gpu 下一行就被置 0，错过就没了。
+        //   为什么要它：output_scale.c 的动态分辨率原本收到 gpu_ms = -1，只能"盲探针"升档；
+        //   有了真实 GPU 时间，它才能按 GPU 余量精确升降（见 05_任务02_减GPU/README.md）。
+        //   初值 -1 = "还没有样本"，output_scale 会走原来的探测分支，不会误判。
+        if (stat_flushes) g_last_gpu_ms_frame = (double)prof_gpu / 1e6 / (double)stat_flushes;
+        prof_sets_alloc = prof_sets_upd = prof_vtx_copy = prof_vtx_bind = 0;  // v9 拆分计时（同窗口归零）
+        // ★ v13：draw 内部 4 个分项也必须在这里归零。
+        //   漏了会怎样：数值只增不减，第二个窗口开始就是「累计值」，
+        //   看起来像"后面越来越慢"，实际是采集 bug —— 这种静默错误最难查。
+        prof_cmd_draw = prof_bind = prof_desc_bind = prof_state = 0;
+        // ★ v16：这三项同样必须在这里归零。
+        //   漏了会怎样：数值只增不减，第二个窗口开始就是「累计值」，
+        //   曲线看起来像「后面越来越慢」，其实是采集 bug —— 和上面 v13 那段同一个坑。
+        prof_vtx_idx = prof_vtx_scan = prof_vtx_expand = 0;
     }
     stat_draws = stat_skipped = stat_passes = stat_dispatches = stat_flushes = stat_wait_ns = 0;
     return stats_text;
@@ -1362,7 +1700,16 @@ static void compile_program(void *arg) {
         if (f) { fprintf(f, "%016llx vs %llx\n", (unsigned long long)h, (unsigned long long)p->code[0]); fclose(f); }
         pthread_mutex_unlock(&lock);
     }
-    if (!sv || !sf) { free(sv); free(sf); atomic_store(&p->state, 2); return; }
+    if (!sv || !sf) {
+        // v10【失败 program 可追踪】：以前 program 编译失败后 state=2 永久跳过，日志里只剩
+        //   [skip: ... failed N]，无法知道是哪些 shader 丢了（= 建筑/几何消失的直接原因）。
+        //   这里把失败的两段 shader 哈希与成败打出来，方便和 [vk]/fshash 日志对照。
+        static int nprogfail = 0;
+        if (nprogfail++ < 60)
+            LOG("[shader] PROGRAM FAILED vs=%016llx fs=%016llx (vs=%s fs=%s) — 该 program 后续 draw 会被跳过(failed)\n",
+                (unsigned long long)vs_fshash, (unsigned long long)fs_fshash, sv ? "ok" : "FAIL", sf ? "ok" : "FAIL");
+        free(sv); free(sf); atomic_store(&p->state, 2); return;
+    }
     p->nbinds = vk_reflect(sv, nv, p->binds, MAX_BIND);
     p->nbinds += vk_reflect(sf, nf, p->binds + p->nbinds, MAX_BIND - p->nbinds);
     p->vs = vk_module(sv, nv);
@@ -1945,6 +2292,14 @@ static void build_pipeline(void *arg) {
         }
     }
     VkResult r = vkCreateGraphicsPipelines(g_vk.dev, use_pcache, 1, &pi, NULL, &pp->pipe);
+    // ★ v13 D 组：图形管线创建次数。
+    //   判据：pipe_create_cnt 持续 > 0 => 每帧都在建管线（缓存没命中），
+    //         那是极大的 CPU 开销，也是卡顿来源 —— 必须修缓存。
+    //         稳定运行时应该接近 0（只在进新区域时短暂升高）。
+    {
+        extern void las_vkstat_on_pipe_create(void);
+        las_vkstat_on_pipe_create();
+    }
     if (rt_diag()) {
         // PIPELINE_CREATE_END marker
         const char *root = getenv("LARECOMP_DATA_ROOT");
@@ -2436,9 +2791,14 @@ static void gcopy_prepare(unsigned stage_mask) {
     // so gcopy should NOT run for it; the flag confirms that (or reveals it does).
     extern uint64_t g_text_fshash;
     static int logged = 0;
+    // v10【日志洪水治理】：v8/v9 里文本 shader 的 [gcopy] 每帧几十行，把 hilog 缓冲冲掉
+    //   （实测 360 秒抓取只剩 15 秒游戏日志，真机诊断取不到数）。默认只打前 20 条，
+    //   需要完整时设 LARECOMP_GCOPY_LOG=1。只改日志，不改任何行为。
+    static int glog_max = -1;
+    if (glog_max < 0) glog_max = getenv("LARECOMP_GCOPY_LOG") ? (1 << 30) : 20;
     int is_text = (g_text_fshash == 0x6443b63b341c73caULL || g_text_fshash == 0x7270eb69fbeccceeULL);
-    if (!logged || is_text) {
-        if (!logged) logged = 1;
+    if (logged < glog_max) {
+        logged++;
         LOG("[gcopy] %d ranges %.1f KB copied to GPU buffer (no heap import)%s\n", m, total / 1024.0,
             is_text ? " [TEXT]" : "");
     }
@@ -2764,7 +3124,12 @@ static VkDescriptorSet stage_set(Prog *p, VkDescriptorSetLayout layout, uint32_t
         w[n].pBufferInfo = &bi[n];
         n++;
     }
-    if (n) vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+    if (n) {
+        // v9 诊断：单独计时「描述符集写入」（vkUpdateDescriptorSets 是驱动调用，移动端可能很贵）
+        uint64_t tu_ = prof ? SDL_GetTicksNS() : 0;
+        vkUpdateDescriptorSets(g_vk.dev, (uint32_t)n, w, 0, NULL);
+        if (prof) prof_sets_upd += SDL_GetTicksNS() - tu_;
+    }
     return ds;
 }
 
@@ -2788,6 +3153,12 @@ static void build_compute(void *arg) {
                                                 .pSpecializationInfo = &spec},
                                       .layout = cp->p.layout};
     VkResult r = vkCreateComputePipelines(g_vk.dev, g_vk.pcache, 1, &ci, NULL, &cp->pipe);
+    // ★ v13 D 组：compute 管线创建次数（和图形管线分开计也行，这里合并到同一个计数器，
+    //   因为分析时关心的都是"管线创建的 CPU 开销"，不分图形/计算）。
+    {
+        extern void las_vkstat_on_pipe_create(void);
+        las_vkstat_on_pipe_create();
+    }
     atomic_fetch_add(&stat_compiles, 1);
     if (r == VK_SUCCESS) atomic_fetch_add(&new_pipes, 1);
     atomic_store(&cp->p.state, r == VK_SUCCESS ? 1 : 2);
@@ -3305,6 +3676,36 @@ static void draw_(CmdRec *r, bool indexed) {
     }
     wait_built(&pp->state);
     if (atomic_load(&pp->state) != 1) { SKIP(5 + (atomic_load(&pp->state) > 1)); return; }
+    // ★ v13 D 组：pipeline 绑定次数。
+    //   为什么只统计主 draw 路径这一次（不统计 1313/4423/4494/4538 那些）：
+    //   那些是 clear/post/present 的一次性绑定，每帧就几次，
+    //   而这里是每 draw 一次（每帧几百次）—— 后者才是"绑定次数"关心的量。
+    //   两者混在一起会让数字失真（几百 + 4 看不出差别，但含义不同）。
+    {
+        extern void las_vkstat_on_pipe_bind(void);
+        las_vkstat_on_pipe_bind();
+    }
+    // ★ v13 采集 prof_state —— 第 1 段：pipeline bind + 全部 vkCmdSet*（深/模板/混合/剔除/拓扑/bias）
+    //
+    //   【为什么用"两段式"计时，而不是一个大窗口】
+    //     从 vkCmdBindPipeline(3498) 到 apply_scissor(3666) 之间，夹着大量与状态无关的逻辑：
+    //       · texture_info 循环（遍历片元纹理）
+    //       · 大段合成/全屏判定（reads_scene / fade_fill / composite）
+    //       · stage_set 构建 fset（已单独计入 prof_sets）
+    //       · gpuw_stores（gmem 写追踪）
+    //     如果用一个大窗口把它们全包进来，state_ms 会严重虚高 ——
+    //     而 perf-optimizer2 正是要用 state_ms 判断「状态去重(A1)值不值得做」，
+    //     虚高会让他白做一轮优化。
+    //   【所以拆成两段】
+    //     第 1 段（这里）：vkCmdBindPipeline → 最后一批 vkCmdSet*（bias）
+    //     第 2 段（apply_scissor 处）：只算 vkCmdSetScissor
+    //     两段累加进同一个 prof_state，语义仍然完整（所有状态调用都算到）。
+    //
+    //   【为什么起点能放这么准】
+    //     这里到 3553 之间只有 SetDepth*/SetStencil*/SetBlend*/SetCull*/SetFrontFace/
+    //     SetPrimitiveTopology/SetPrimitiveRestart/SetDepthBias* —— 全是纯状态调用，
+    //     中间只有几个局部变量计算（compare_fn/stencil_op 等纯函数，纳秒级）。
+    uint64_t _st_t0 = prof ? SDL_GetTicksNS() : 0;
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pp->pipe);
     uint64_t prof_td_ = prof ? SDL_GetTicksNS() : 0;
     if (prof) prof_key += prof_td_ - prof_tk_;
@@ -3362,6 +3763,9 @@ static void draw_(CmdRec *r, bool indexed) {
         vkCmdSetDepthBiasEnable(cb, on);
         vkCmdSetDepthBias(cb, f[1], f[2], f[0]);
     }
+    // ★ v13 采集 prof_state —— 第 1 段收口（pipeline bind + 全部 vkCmdSet* 到此为止）。
+    //   下面开始是纹理/视口/合成判定的业务逻辑，不属于动态状态。
+    if (prof) { prof_state += SDL_GetTicksNS() - _st_t0; }
 
     // ---- textures first (their scales feed the widescreen decision and the rscale table), then the viewport
     float *vp = st.viewport[0];
@@ -3461,7 +3865,25 @@ static void draw_(CmdRec *r, bool indexed) {
                 vp_sx, vp_sy);
         }
     }
-    apply_scissor();
+    // ★ v13 采集 prof_state —— 第 2 段：只算 apply_scissor()（内部是 vkCmdSetScissor）。
+    //
+    //   【为什么单独计这一段，而不是并进第 1 段】
+    //     apply_scissor() 在业务逻辑中间被调用（视口/scissor 要等纹理信息算完才能定），
+    //     它和第 1 段之间隔着一两百行的纹理遍历、合成判定、fset 构建、gpuw_stores。
+    //     如果用一个大窗口把中间全包进来，state_ms 会虚高数倍。
+    //     所以拆两段，各自只覆盖真正的状态调用。
+    //
+    //   【这一段为什么值得单独计】
+    //     vkCmdSetScissor 是每 draw 一次的动态状态调用，属于 perf-optimizer2 想优化的
+    //     「vkCmdSet* 去重」范围。如果它很贵，也计入 state_ms 的收益评估里。
+    if (prof) {
+        uint64_t _sc_t0 = SDL_GetTicksNS();
+        apply_scissor();
+        prof_state += SDL_GetTicksNS() - _sc_t0;
+    } else {
+        apply_scissor();
+    }
+
     float rs0[4] = {vp_sx, vp_sy, vp_ox, vp_oy};
     uint64_t prof_t1_ = prof ? SDL_GetTicksNS() : 0;
     gpuw_stores(pr->vi, st.sbuf[0], 16, "vertex shader", st.program->stages[0].code_addr);
@@ -3469,9 +3891,18 @@ static void draw_(CmdRec *r, bool indexed) {
     VkDescriptorSet fset = stage_set(pr, pr->set_layout[1], 1, 1, pr->fi, rs0, tint, 0, 0, 0, fii);
     if (prof) prof_sets += SDL_GetTicksNS() - prof_t1_;
     VkDescriptorSet sets[2] = {vset, fset};
+    // 起 prof_desc_bind：vkCmdBindDescriptorSets 本身
+    uint64_t _db_t0 = prof ? SDL_GetTicksNS() : 0;
     vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, pr->layout, 0, 2, sets, 0, NULL);
+    // 收口 prof_desc_bind。
+    // 判据：desc_bind_ms 大 => 描述符绑定有冗余（同样的 set 反复绑）=> 该加状态缓存。
+    if (prof) { prof_desc_bind += SDL_GetTicksNS() - _db_t0; }
 
     uint64_t prof_t2_ = prof ? SDL_GetTicksNS() : 0;
+    // ★ v16 诊断：索引处理块计时起点（覆盖到「索引块结束」为止）。
+    //   这一段原本在 prof_vtx 里，但没细分；v15 发现它含 2.70ms 未归类开销，
+    //   其中 scan_max_index / 8bit 展开是可以用 NEON 优化的标量循环。
+    uint64_t _t_idx = prof ? SDL_GetTicksNS() : 0;
     // ---- indices (copied; the largest index bounds the vertex data copied below)
     uint32_t first = 0, count = (uint32_t)r->x[2], inst, base_inst, max_index = 0;
     int32_t base_vertex = 0;
@@ -3505,13 +3936,20 @@ static void draw_(CmdRec *r, bool indexed) {
                 scan_src = src; scan_isz = isz; scan_restart = restart;  // max_index only if a stream gets copied
             } else {
                 ib = transient_gpu_copy(src, (uint64_t)count * isz + 4, 4);
+                // ★ v16 诊断：单独计 scan_max_index 的耗时（NEON 优化的精确目标）
+                uint64_t _t_scan = prof ? SDL_GetTicksNS() : 0;
                 { uint32_t m = scan_max_index(src, isz, count, restart); if (m > max_index) max_index = m; }
+                if (prof) prof_vtx_scan += SDL_GetTicksNS() - _t_scan;
             }
         } else if (native) {  // 8-bit indices: widen to 16
             ib = vk_transient((uint64_t)count * 2 + 4, 4);
             uint16_t *w = ib.ptr;
             const uint8_t *s = src;
+            // ★ v16 诊断：单独计 8bit→16bit 展开循环的耗时（NEON 优化的另一个目标）
+            //   计时点必须在 for 循环【外面】—— 循环内加 clock_gettime 会让开销暴增。
+            uint64_t _t_exp = prof ? SDL_GetTicksNS() : 0;
             for (uint32_t i = 0; i < count; i++) { w[i] = s[i] == 0xFF && st.prim_restart ? 0xFFFF : s[i]; if (s[i] > max_index && w[i] != 0xFFFF) max_index = s[i]; }
+            if (prof) prof_vtx_expand += SDL_GetTicksNS() - _t_exp;
             itype_vk = VK_INDEX_TYPE_UINT16;
             icount = count;
         } else {
@@ -3525,9 +3963,54 @@ static void draw_(CmdRec *r, bool indexed) {
             if (base_vertex > 0) max_index += (uint32_t)base_vertex;
         }
     }
-    if (use_index) vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+    // ★ v16 诊断：索引处理块计时收口。
+    //   这里紧跟在索引处理之后、索引绑定之前，所以 vtx_idx 只覆盖索引数据的准备
+    //   （expand_indices / scan_max_index / 8bit 展开 / vk_transient 分配），
+    //   不含 vkCmdBindIndexBuffer（那笔已计入 prof_bind）。
+    //   子项关系：vtx_scan ⊂ vtx_idx, vtx_expand ⊂ vtx_idx，分析时勿相加。
+    if (prof) prof_vtx_idx += SDL_GetTicksNS() - _t_idx;
+    // ★ v13 采集：索引缓冲绑定计入 prof_bind（和顶点绑定合并成一个"绑定开销"总数）。
+    //   判据：bind_ms + desc_bind_ms 大 => 冗余绑定 => 加状态缓存。
+    if (use_index) {
+        if (prof) {
+            uint64_t _ib_t0 = SDL_GetTicksNS();
+            vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+            prof_bind += SDL_GetTicksNS() - _ib_t0;
+        } else {
+            vkCmdBindIndexBuffer(cb, ib.buf, ib.off, itype_vk);
+        }
+    }
 
     // ---- vertex streams: the range this draw can read, copied once per submission
+    // v9【CPU 优化 1：顶点绑定合批】—— 原实现是「每个 stream 单独调用一次 vkCmdBindVertexBuffers」。
+    //   为什么改：室外重场景每帧 600~800 个 draw、每个 draw 用 3~5 个 stream，等于每帧 3000+ 次
+    //   驱动绑定调用；实测 vtx 约 6ms/帧（tex_menu 户外数据），其中相当部分是「调用次数」而不是拷贝字节。
+    //   改成「相邻（连续的）binding 合并成一次批量调用」后，调用数按连续段数计算，通常一个 draw 只需 1 次。
+    //   语义完全不变：每个 binding 的 buffer/offset 仍逐项写入，只是把它们放进同一次 API 调用。
+    //   合并时若 stream 号断号（例如只用到 0,1,3），就在断号处提交一段，绝不把未使用的 binding 绑上垃圾缓冲。
+    //   时间拆分：prof_vtx_copy（memcpy 拷贝）/ prof_vtx_bind（绑定 API 调用）分别计时，供下一步优化判断。
+#define VTX_BIND_FLUSH()                                                                      \
+    do {                                                                                      \
+        if (run_n) {                                                                          \
+            if (prof) {                                                                       \
+                uint64_t tb_ = SDL_GetTicksNS();                                              \
+                vkCmdBindVertexBuffers(cb, run_start, run_n, run_buf, run_off);               \
+                uint64_t dt_ = SDL_GetTicksNS() - tb_;                                        \
+                prof_vtx_bind += dt_;                                                         \
+                prof_bind += dt_;   /* v13：并入统一的"绑定开销"分项 */                        \
+            } else {                                                                          \
+                vkCmdBindVertexBuffers(cb, run_start, run_n, run_buf, run_off);               \
+            }                                                                                 \
+            run_n = 0;                                                                        \
+        }                                                                                     \
+    } while (0)
+    VkBuffer run_buf[17];
+    VkDeviceSize run_off[17];
+    uint32_t run_start = 0, run_n = 0;
+    // v10：合批开关（默认 1 = 保持 v9 行为）。LARECOMP_VTX_BATCH=0 时每个 stream 单独提交一次，
+    //      等价于 v8 原实现——用来隔离「建筑白板回归是否与合批有关」。
+    static int vtx_batch = -1;
+    if (vtx_batch < 0) vtx_batch = getenv("LARECOMP_VTX_BATCH") ? atoi(getenv("LARECOMP_VTX_BATCH")) : 1;
     for (int s = 0; s < 17; s++) {
         if (!(k.used_streams & (1u << s))) continue;
         VkSpan sp;
@@ -3539,7 +4022,12 @@ static void draw_(CmdRec *r, bool indexed) {
             VkBuffer dbuf;
             VkDeviceSize doff;
             if (v.addr && v.size && vtx_direct(v.addr, v.size, &dbuf, &doff)) {
-                vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &dbuf, &doff);
+                if (run_n && (uint32_t)s != run_start + run_n) VTX_BIND_FLUSH();  // 断号：先提交上一段
+                if (!run_n) run_start = (uint32_t)s;
+                run_buf[run_n] = dbuf;
+                run_off[run_n] = doff;
+                run_n++;
+                if (!vtx_batch) VTX_BIND_FLUSH();  // 关合批：逐 stream 立即提交
                 continue;
             }
             if (scan_src) {  // copying after all: the index scan bounds the copy
@@ -3555,16 +4043,24 @@ static void draw_(CmdRec *r, bool indexed) {
             if (v.size && need > v.size) need = v.size;
             if (!v.addr) { static const uint8_t zero[256]; sp = vk_transient_copy(zero, 256, 16); }
             else {
+                uint64_t tc_ = prof ? SDL_GetTicksNS() : 0;
                 sp = vertex_copy(v.addr, need ? need : 16, v.size, k.divisor[s] == 0);
+                if (prof) prof_vtx_copy += SDL_GetTicksNS() - tc_;
                 if (ENV("LARECOMP_LOG_VCOPY") && g_gpuprof_frame)  // (research: what a profiled frame copies, per stream)
                     LOG("[vcopy] vs %llx stream %d addr %llx need %llu of bound %llu stride %llu %s max_index %u base_vertex %d base_inst %u inst %u\n",
                         (unsigned long long)st.program->stages[0].code_addr, s, (unsigned long long)v.addr, (unsigned long long)need,
                         (unsigned long long)v.size, (unsigned long long)stride, k.divisor[s] ? "instance" : "vertex", max_index, base_vertex, base_inst, inst);
             }
         }
-        VkDeviceSize off = sp.off;
-        vkCmdBindVertexBuffers(cb, (uint32_t)s, 1, &sp.buf, &off);
+        if (run_n && (uint32_t)s != run_start + run_n) VTX_BIND_FLUSH();  // 断号：先提交上一段
+        if (!run_n) run_start = (uint32_t)s;
+        run_buf[run_n] = sp.buf;
+        run_off[run_n] = sp.off;
+        run_n++;
+        if (!vtx_batch) VTX_BIND_FLUSH();  // 关合批：逐 stream 立即提交
     }
+    VTX_BIND_FLUSH();
+#undef VTX_BIND_FLUSH
 
     if (prof) prof_vtx += SDL_GetTicksNS() - prof_t2_;
     // ---- draw
@@ -3609,8 +4105,18 @@ static void draw_(CmdRec *r, bool indexed) {
         if (!ov_logged) { ov_logged = 1; LOG("[diag] v0085: dialog draw: forced cull NONE + depth OFF\n"); }
     }
     if (exp_hit && exp_mode == 1) { /* skipped */ }
-    else if (!use_index) vkCmdDraw(cb, count, inst_eff, first, base_inst);
-    else vkCmdDrawIndexed(cb, icount, inst_eff, 0, base_vertex, base_inst);
+    // ★ v13 采集：vkCmdDraw / vkCmdDrawIndexed 这两个调用【本身】的耗时。
+    //   判据：如果这一项就占了 draw 的大头（80%+），说明是驱动层面的调用开销，
+    //         软件侧只能靠减少 draw 数量（合批/实例化）来解决。
+    //   如果这一项很小、而 bind+desc_bind 很大，那才是"冗余绑定"，加状态缓存就能省。
+    else if (!use_index) {
+        if (prof) { uint64_t _cd = SDL_GetTicksNS(); vkCmdDraw(cb, count, inst_eff, first, base_inst); prof_cmd_draw += SDL_GetTicksNS() - _cd; }
+        else vkCmdDraw(cb, count, inst_eff, first, base_inst);
+    }
+    else {
+        if (prof) { uint64_t _cd = SDL_GetTicksNS(); vkCmdDrawIndexed(cb, icount, inst_eff, 0, base_vertex, base_inst); prof_cmd_draw += SDL_GetTicksNS() - _cd; }
+        else vkCmdDrawIndexed(cb, icount, inst_eff, 0, base_vertex, base_inst);
+    }
     if (gp_q) { vkCmdEndQuery(cb, gps_qp, (uint32_t)gps_n); gp_stat[gp_n - 1] = gps_n + 1; gps_n++; }
     if (exp_hit && exp_mode == 2) apply_scissor();
     stat_draws++;
@@ -3796,6 +4302,48 @@ static void copy_buffer_to_texture(uint64_t src, const TexRefRec *dst) {
         if (nlog++ < 5) LOG("[vk] buffer -> ASTC texture copy skipped (%ux%u)\n", t->width, t->height);
         return;
     }
+    // BC 纹理在 GPU 上是 RGBA8（无 BC 支持的移动 GPU 走 CPU 解码，见 textures.c），但 guest 传过来的源数据是
+    // 压缩块。原来这里会按每纹素 bpb 逐行 memcpy，把 8/16 字节的块当成 4 字节 RGBA 纹素直通 —— GPU 采到的
+    // 就是块头/索引字节，表现为**彩色噪点 + 水平条纹**（画面里 5 个菜单图标正是这种症状）。
+    // 修法：先按块行把 guest 的源数据拷出来，再做 BC 解码，最后按 RGBA8 行距上传。
+    if (b->bc_kind) {
+        const int bkind = (int)b->bc_kind;
+        const uint32_t bs = vk_bc_block_bytes(bkind);
+        // 归一化区域：rg[3]/rg[4] 为 0 表示「整个纹理」，与 copy_region_dims 的约定一致。
+        // 块表必须恰好覆盖 ceil(w/4) x ceil(h/4)，否则 block 指针会读到块表外（尾部就是噪声）。
+        const uint32_t ow = (uint32_t)rg[3] ? (uint32_t)rg[3] : t->width;
+        const uint32_t oh = (uint32_t)rg[4] ? (uint32_t)rg[4] : t->height;
+        const uint32_t src_bw = (ow + 3) / 4;
+        const uint32_t src_bh = (oh + 3) / 4;
+        if (!ow || !oh || level < 0 || level >= (int)b->levels) return;
+        {   // 诊断：首次出现时打一行，主 Agent 在真机上跑一次菜单就能确认这条路径是否被走到
+            static int nbc;
+            if (nbc++ < 8)
+                LOG("[vk] buf2tex BC: nvn fmt %#x kind %d %ux%u region %d,%d %dx%d -> decoded RGBA8 (%u blocks/row)\n",
+                    t->format, bkind, t->width, t->height, rg[0], rg[1], rg[3], rg[4], src_bw);
+        }
+        // guest 的源行距：优先用命令里设置的 copy row stride，否则按块行紧凑排列（ceil(w/4)*bs）
+        const uint64_t bc_row = st.copy_row_stride ? st.copy_row_stride : (uint64_t)src_bw * bs;
+        const uint64_t blocks_bytes = (uint64_t)src_bw * src_bh * bs;
+        uint8_t *blocks = malloc(blocks_bytes ? blocks_bytes : 1);
+        if (!blocks) {
+            static int nm;
+            if (nm++ < 5) LOG("[vk] buf2tex BC: malloc %llu failed, copy skipped\n", (unsigned long long)blocks_bytes);
+            return;
+        }
+        // 源数据按 guest 行距逐块行拷成紧凑块表；注意 src 是 guest 物理地址，越界保护交给上层（src 由命令给出）
+        for (uint32_t y = 0; y < src_bh; y++)
+            memcpy(blocks + (uint64_t)y * src_bw * bs,
+                   (const uint8_t *)(uintptr_t)(src + (uint64_t)y * bc_row), src_bw * bs);
+        VkSpan dec = vk_transient((uint64_t)ow * oh * 4, 16);
+        bc_decode_ldr(blocks, ow, oh, bkind, b->bc_srgb != 0, dec.ptr);
+        free(blocks);
+        VkBufferImageCopy c = {.bufferOffset = dec.off, .bufferRowLength = ow, .bufferImageHeight = oh,
+                               .imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, (uint32_t)level, 0, 1},
+                               .imageOffset = {rg[0], rg[1], 0}, .imageExtent = {ow, oh, 1}};
+        vkCmdCopyBufferToImage(vk_cmd(), dec.buf, b->image, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+        return;
+    }
     bool array = b->layers > 1 && b->depth == 1;
     uint32_t hb = ((uint32_t)rg[4] + fi->bh - 1) / fi->bh, wb = ((uint32_t)rg[3] + fi->bw - 1) / fi->bw;
     uint32_t out_bpb = fi->bpb == 3 ? 4 : fi->bpb;
@@ -3830,6 +4378,16 @@ static void copy_texture_to_buffer(const TexRefRec *src, uint64_t dst) {
     copy_region_dims(t, src, &fi, rg, &level, &row, &img);
     if (!fi || !fi->bpb || fi->bpb == 3 || row % fi->bpb) return;
     TexBackend *b = vk_tex(t, false);
+    // BC 纹理在 GPU 上存的是 CPU 解码后的 RGBA8（见 textures.c），不是压缩块。把这个图像按"块"读回 guest
+    // 内存会写进错长度的数据，把那片 guest 纹理内存弄脏 —— 之后 upload_texture 再按 BC 解，就是一片噪声。
+    // 反向重编码 BC 没有实现（bc.c 只有解码器），所以这里宁可跳过，也不要污染 guest 的源数据。
+    if (b->bc_kind) {
+        static int nbc;
+        if (nbc++ < 5)
+            LOG("[vk] tex2buf BC skipped: nvn fmt %#x kind %d %ux%u level %d (decoded RGBA8 cannot be re-encoded)\n",
+                t->format, (int)b->bc_kind, t->width, t->height, level);
+        return;
+    }
     float tsx, tsy;
     renderer_texture_scale(t, &tsx, &tsy);
     VkCommandBuffer cb = vk_cmd();

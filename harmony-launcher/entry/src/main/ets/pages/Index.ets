@@ -6,7 +6,21 @@ import { pasteboard, zlib } from '@kit.BasicServicesKit';
 import { fileIo as fs } from '@kit.CoreFileKit';
 import { picker } from '@kit.CoreFileKit';
 import { promptAction, display } from '@kit.ArkUI';
-import { getVkInfo, getHmsInfo, startGame, prepareGameDataDir, attachXComponent, padButton, padAxis, padReset, getFps, pollSwkbd, submitSwkbd } from 'libentry.so';
+import { getVkInfo, getHmsInfo, startGame, prepareGameDataDir, attachXComponent, padButton, padAxis, padReset, getFps, pollSwkbd, submitSwkbd, startCollect, stopCollect } from 'libentry.so';
+import { vibrator } from '@kit.SensorServiceKit';
+import { BusinessError } from '@kit.BasicServicesKit';
+
+// 虚拟按键布局：位置（百分比）+ 是否显示。方向键与 ABXY 永远显示（见 padLocked）。
+interface PadCfg {
+  x: number;
+  y: number;
+  on: boolean;
+}
+
+interface PadEntry {
+  code: string;
+  label: string;
+}
 
 // romfs.bin 解压后的固定大小（gzip 的 ISIZE 只存低 32 位，不能用这个数直接比较）
 const ROMFS_SIZE: number = 4430284852;
@@ -81,6 +95,7 @@ struct Index {
   @State baseY: number = 800;
   @State overlayName: string = '';  // '' | 'pad' | 'display' | 'about'（全屏卡片漂浮层）
   @State padMode: string = 'stick';  // stick=摇杆方向（默认，官方触点跟随方案）/ dpad=十字键方向
+  @State padLayout: string = '';     // 虚拟键布局：code:x%,y%,on ; 空 = 全部默认
   // 显示设置：写入 larecomp.ini，下次「开始游戏」生效
   @State dsRes: number = 0;              // render_height：0=自动，720/1080/1440/2160
   @State dsDynamic: boolean = false;     // resolution=dynamic
@@ -91,6 +106,29 @@ struct Index {
   @State dsRenderThread: boolean = true;
   @State dsVertexRead: string = 'copy';  // auto | copy | direct（移植层默认 copy）
   @State dsVkProf: boolean = false;      // LARECOMP_VK_PROF：帧时间诊断日志
+  @State dsCollect: boolean = false;     // 数据采集闸门（larecomp.ini: collect=1）：开启后游戏内录制按钮可用
+  @State dsTexCheck: boolean = true;     // 纹理校验：开=哈希/比较（默认）；关=不校验直接输出
+  @State dsAstcRt: boolean = false;       // ASTC 转码（实测 BC 软解更快，默认关）：开=BC解→ASTC上传（默认）；关=BC解→RGBA直传
+  @State dsCollectDelay: number = 10;    // 保留键位兼容（当前不再使用，录制改为按钮手动触发）
+  @State recOn: boolean = false;         // 游戏内录制中
+  @State recSec: number = 0;             // 已录制秒数
+  private recTimer: number = -1;
+  @State padEdit: boolean = false;       // 全屏拖拽编辑布局
+  @State padEditMode: number = 0;        // 0=拖拽模式（不能隐藏/恢复） 1=隐藏恢复模式（不能拖）
+  @State dbgTouch: string = '';          // 拖拽调试读数（确认单位口径用）
+  // 拖拽用轻量状态：只改被拖那一个键的 position，避免每次 Move 重建整个布局字符串。
+  @State dragCode: string = '';
+  @State dragOn: boolean = false;
+  @State dragX: number = 0;              // 被拖键的左上角（vp）
+  @State dragY: number = 0;
+  private grabDX: number = 0;            // 按下时手指相对按钮左上角的偏移（vp）
+  private grabDY: number = 0;
+  private startBX: number = 0;           // 拖拽开始时按钮左上角（vp）
+  private startBY: number = 0;
+  private pressAt: number = 0;
+  private padSilent: boolean = false;    // 拖动中不写盘，松手再写
+  private editW: number = 0;
+  private editH: number = 0;
   @State dsAspect: string = 'game';      // game | fill | 43
   @State dsFill: number = 1.245;
   @State dsMovieRes: number = 0;         // movie_max：0=原生，720/540
@@ -144,6 +182,289 @@ struct Index {
     return this.appFilesDir() + '/lasrecomp/larecomp.ini';
   }
 
+  // 只改一个键，保留 ini 里其它内容（语言 / 采集 / 按键绑定都不动）
+  private iniWrite(key: string, val: string): void {
+    try {
+      let txt = '';
+      try { txt = fs.readTextSync(this.iniPath()); } catch (e) { /* 新建 */ }
+      const lines: string[] = (txt.length > 0) ? txt.split('\n') : [];
+      const out: string[] = [];
+      let done = false;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (line.length === 0) continue;
+        const eq = line.indexOf(' = ');
+        if (eq >= 0 && line.substring(0, eq).trim() === key) {
+          out.push(key + ' = ' + val);
+          done = true;
+        } else {
+          out.push(line);
+        }
+      }
+      if (!done) out.push(key + ' = ' + val);
+      try { fs.mkdirSync(this.appFilesDir() + '/lasrecomp'); } catch (e) { /* 已存在 */ }
+      const file = fs.openSync(this.iniPath(),
+        fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.TRUNC);
+      try {
+        fs.writeSync(file.fd, out.join('\n') + '\n');
+      } finally {
+        fs.closeSync(file);
+      }
+    } catch (e) {
+      promptAction.showToast({ message: '保存失败，请检查数据目录' });
+    }
+  }
+
+  // ---- 虚拟按键布局：默认位置（百分比）----
+  // 初始布局按"网格对齐"设计，不再七扭八歪：
+  //   左上角一排：L / ZL        顶部偏左：－(select)   顶部偏右：+(start)   右上角一排：ZR / R
+  //   左下十字键：↑←→↓ 成菱形    右下 ABXY 成菱形
+  private padDefX(code: string): number {
+    if (code === 'up' || code === 'down') return 12;
+    if (code === 'left') return 4;
+    if (code === 'right') return 20;
+    if (code === 'x' || code === 'a') return 82;
+    if (code === 'y') return 74;
+    if (code === 'b') return 90;
+    if (code === 'l') return 2;
+    if (code === 'zl') return 9;
+    if (code === 'select') return 26;
+    if (code === 'start') return 62;
+    if (code === 'zr') return 79;
+    if (code === 'r') return 86;
+    return 50;
+  }
+
+  private padDefY(code: string): number {
+    if (code === 'up' || code === 'x') return 64;
+    if (code === 'down' || code === 'a') return 84;
+    if (code === 'left' || code === 'right' || code === 'y' || code === 'b') return 74;
+    if (code === 'l' || code === 'zl' || code === 'r' || code === 'zr'
+        || code === 'start' || code === 'select') return 5;
+    return 50;
+  }
+
+  // 基础操作键：一律不允许删除。
+  // 方向（上下左右 + 摇杆那套）删了不能走路；ABXY 删了不能确认/取消/交互。
+  private padLocked(code: string): boolean {
+    return code === 'up' || code === 'down' || code === 'left' || code === 'right'
+      || code === 'a' || code === 'b' || code === 'x' || code === 'y';
+  }
+
+  private padCfg(code: string): PadCfg {
+    let x = this.padDefX(code);
+    let y = this.padDefY(code);
+    let on = true;
+    const parts = this.padLayout.length > 0 ? this.padLayout.split(';') : [];
+    for (let i = 0; i < parts.length; i++) {
+      const t = parts[i];
+      if (t.length === 0) continue;
+      const f = t.split(':');
+      if (f.length !== 2 || f[0] !== code) continue;
+      const v = f[1].split(',');
+      if (v.length !== 3) continue;
+      const px = parseFloat(v[0]);
+      const py = parseFloat(v[1]);
+      if (!isNaN(px)) x = px;
+      if (!isNaN(py)) y = py;
+      on = (v[2] === '1');
+    }
+    if (this.padLocked(code)) on = true;   // 锁定的键永不被隐藏
+    const r: PadCfg = { x: x, y: y, on: on };
+    return r;
+  }
+
+  private padSet(code: string, x: number, y: number, on: boolean): void {
+    const px = Math.max(0, Math.min(94, x));
+    const py = Math.max(0, Math.min(94, y));
+    const keep = this.padLocked(code) ? true : on;
+    const parts = this.padLayout.length > 0 ? this.padLayout.split(';') : [];
+    const out: string[] = [];
+    let done = false;
+    for (let i = 0; i < parts.length; i++) {
+      const t = parts[i];
+      if (t.length === 0) continue;
+      const f = t.split(':');
+      if (f.length === 2 && f[0] === code) {
+        out.push(code + ':' + px.toFixed(1) + ',' + py.toFixed(1) + ',' + (keep ? '1' : '0'));
+        done = true;
+      } else {
+        out.push(t);
+      }
+    }
+    if (!done) out.push(code + ':' + px.toFixed(1) + ',' + py.toFixed(1) + ',' + (keep ? '1' : '0'));
+    this.padLayout = out.join(';');
+    if (!this.padSilent) {
+      this.iniWrite('pad_layout', this.padLayout);
+      this.iniWrite('pad_mode', this.padMode);
+    }
+  }
+
+  private padNudge(code: string, dx: number, dy: number): void {
+    const c = this.padCfg(code);
+    this.padSet(code, c.x + dx, c.y + dy, c.on);
+  }
+
+  private padToggleVisible(code: string): void {
+    if (this.padLocked(code)) return;
+    const c = this.padCfg(code);
+    this.padSet(code, c.x, c.y, !c.on);
+  }
+
+  private padResetAll(): void {
+    this.padLayout = '';
+    this.iniWrite('pad_layout', '');
+    promptAction.showToast({ message: '虚拟按键已恢复默认位置' });
+  }
+
+  // 「操作方式」面板里可编辑的虚拟键清单（顺序即面板顺序）
+  private padEntries(): PadEntry[] {
+    const list: PadEntry[] = [
+      { code: 'up', label: '↑' }, { code: 'left', label: '←' },
+      { code: 'right', label: '→' }, { code: 'down', label: '↓' },
+      { code: 'a', label: 'A' }, { code: 'b', label: 'B' },
+      { code: 'x', label: 'X' }, { code: 'y', label: 'Y' },
+      { code: 'l', label: 'L' }, { code: 'zl', label: 'ZL' },
+      { code: 'r', label: 'R' }, { code: 'zr', label: 'ZR' },
+      { code: 'start', label: '+' }, { code: 'select', label: '－' }
+    ];
+    return list;
+  }
+
+  // 两个可见按钮是否重叠（按 52vp 的圆形外接方框估算，单位换算成百分比）
+  private padOverlap(a: PadCfg, b: PadCfg): boolean {
+    if (!a.on || !b.on) return false;
+    const sw: number = this.editW > 0 ? 52 / this.editW * 100 : 0;
+    const sh: number = this.editH > 0 ? 52 / this.editH * 100 : 0;
+    return Math.abs(a.x - b.x) < sw && Math.abs(a.y - b.y) < sh;
+  }
+
+  // 编辑器渲染用的坐标：正在拖的那个键用 dragX/dragY（vp），其余用配置的百分比换算成 vp。
+  private padDrawX(code: string): number {
+    if (this.dragOn && this.dragCode === code) return this.dragX;
+    return this.padCfg(code).x * this.editW / 100;
+  }
+
+  private padDrawY(code: string): number {
+    if (this.dragOn && this.dragCode === code) return this.dragY;
+    return this.padCfg(code).y * this.editH / 100;
+  }
+
+  private padHasConflict(code: string): boolean {
+    const c = this.padCfg(code);
+    if (!c.on) return false;
+    const all = this.padEntries();
+    for (let i = 0; i < all.length; i++) {
+      if (all[i].code === code) continue;
+      if (this.padOverlap(c, this.padCfg(all[i].code))) return true;
+    }
+    return false;
+  }
+
+  private padAnyConflict(): boolean {
+    const all = this.padEntries();
+    for (let i = 0; i < all.length; i++) {
+      if (this.padHasConflict(all[i].code)) return true;
+    }
+    return false;
+  }
+
+  private padAdvancedInfoCount(): number {
+    return this.padAnyConflict() ? 1 : 0;
+  }
+
+  // 打开全屏拖拽编辑器
+  private padOpenEditor(): void {
+    try {
+      const d = display.getDefaultDisplaySync();
+      // 应用锁横屏：长边=宽、短边=高。统一换算成 vp，和 .position({x:'%'}) 的口径一致。
+      const wpx: number = Math.max(d.width, d.height);
+      const hpx: number = Math.min(d.width, d.height);
+      this.editW = px2vp(wpx) > 0 ? px2vp(wpx) : 1;
+      this.editH = px2vp(hpx) > 0 ? px2vp(hpx) : 1;
+    } catch (e) {
+      this.editW = 1;
+      this.editH = 1;
+    }
+    this.overlayName = '';
+    this.padEditMode = 0;
+    this.padEdit = true;
+  }
+
+  private padSaveEditor(): void {
+    this.padSilent = false;
+    this.iniWrite('pad_mode', this.padMode);
+    this.iniWrite('pad_layout', this.padLayout);
+    this.padEdit = false;
+    promptAction.showToast({ message: '按钮布局已保存，下次启动继续沿用' });
+  }
+
+  // 编辑器里的触摸：
+  //   模式 0（拖拽）：按住 350ms 后拖动，松手固定并写盘；点一下不改变显隐。
+  //   模式 1（隐藏/恢复）：点一下按钮就切换显隐，绝不能拖动。
+  private onEditTouch(e: TouchEvent, code: string): void {
+    if (this.padEditMode === 1) {
+      if (e.type === TouchType.Down) {
+        this.padToggleVisible(code);
+        if (!this.padLocked(code)) {
+          promptAction.showToast({ message: this.padCfg(code).on ? '已显示' : '已隐藏' });
+        }
+      }
+      return;
+    }
+    const t: TouchObject = e.touches.length > 0 ? e.touches[0] : e.changedTouches[0];
+    const tx: number = px2vp(t.windowX);
+    const ty: number = px2vp(t.windowY);
+    if (e.type === TouchType.Down) {
+      this.dragCode = code;
+      this.dragOn = false;
+      this.pressAt = Date.now();
+      // 记录"手指相对按钮左上角"的偏移：这样按下去不会把按钮吸到手指中心（不会"初始到一个位置"）
+      const c = this.padCfg(code);
+      this.grabDX = tx - c.x * this.editW / 100;
+      this.grabDY = ty - c.y * this.editH / 100;
+    } else if (e.type === TouchType.Move) {
+      if (this.dragCode !== code) return;
+      if (!this.dragOn) {
+        if (Date.now() - this.pressAt < 200) return;
+        this.dragOn = true;
+      }
+      // ★ 只改被拖这一个键的 position（一个数字属性），不重建布局字符串、不写盘 —— 这才跟手
+      this.dragX = Math.max(0, Math.min(this.editW - 52, tx - this.grabDX));
+      this.dragY = Math.max(0, Math.min(this.editH - 52, ty - this.grabDY));
+      this.dbgTouch = 'touch=' + tx.toFixed(0) + ',' + ty.toFixed(0)
+        + '  edit=' + this.editW.toFixed(0) + ',' + this.editH.toFixed(0)
+        + '  btn=' + this.dragX.toFixed(0) + ',' + this.dragY.toFixed(0);
+    } else {
+      if (this.dragCode === code && this.dragOn) {
+        // 松手才提交：vp 坐标换成百分比，写一次 ini
+        this.padSet(code, this.dragX / this.editW * 100, this.dragY / this.editH * 100, this.padCfg(code).on);
+      }
+      this.dragCode = '';
+      this.dragOn = false;
+    }
+  }
+
+  private loadPadSettings(): void {
+    this.padMode = 'stick';
+    this.padLayout = '';
+    try {
+      const txt = fs.readTextSync(this.iniPath());
+      const lines = txt.split('\n');
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        const eq = line.indexOf(' = ');
+        if (eq < 0) continue;
+        const k = line.substring(0, eq).trim();
+        const v = line.substring(eq + 3).trim();
+        if (k === 'pad_mode') this.padMode = (v === 'dpad') ? 'dpad' : 'stick';
+        else if (k === 'pad_layout') this.padLayout = v;
+      }
+    } catch (e) {
+      // 配置尚未生成
+    }
+  }
+
   // 读取 larecomp.ini；缺失的键用移植层默认值
   private loadDisplaySettings(): void {
     this.dsRes = 0;
@@ -155,6 +476,10 @@ struct Index {
     this.dsRenderThread = true;
     this.dsVertexRead = 'copy';
     this.dsVkProf = false;
+    this.dsCollect = false;
+    this.dsCollectDelay = 10;
+    this.dsTexCheck = true;
+    this.dsAstcRt = false;
     this.dsAspect = 'game';
     this.dsMovieRes = 0;
     this.dsAudoutMs = 200;
@@ -200,6 +525,15 @@ struct Index {
           this.dsVertexRead = (v === 'copy' || v === 'direct') ? v : 'auto';
         } else if (k === 'vk_prof') {
           this.dsVkProf = (v !== '0');
+        } else if (k === 'tex_nocheck') {
+          this.dsTexCheck = (parseInt(v, 10) === 0);
+        } else if (k === 'astc_rt') {
+          this.dsAstcRt = (parseInt(v, 10) !== 0);
+        } else if (k === 'collect') {
+          this.dsCollect = (parseInt(v, 10) > 0);
+        } else if (k === 'collect_delay') {
+          const n = parseInt(v, 10);
+          this.dsCollectDelay = (n >= 1 && n <= 120) ? n : 10;
         } else if (k === 'aspect') {
           this.dsAspect = (v === 'fill' || v === '43') ? v : 'game';
         } else if (k === 'aspect_fill') {
@@ -237,7 +571,10 @@ struct Index {
       'fps': this.dsFps60 ? '60' : '30',
       'render_thread': this.dsRenderThread ? '1' : '0',
       'vertex_read': this.dsVertexRead,
-      'vk_prof': this.dsVkProf ? '1' : '0',
+      'tex_nocheck': this.dsTexCheck ? '0' : '1',
+      'astc_rt': this.dsAstcRt ? '1' : '0',
+      'collect': this.dsCollect ? '1' : '0',
+      'collect_delay': this.dsCollectDelay.toString(),
       'aspect': this.dsAspect,
       'aspect_fill': this.dsFill.toFixed(4),
       'movie_max': this.dsMovieRes.toString(),
@@ -247,7 +584,8 @@ struct Index {
       'reverb': this.dsReverb ? '1' : '0'
     };
     const keys: string[] = ['render_height', 'resolution', 'upscaler', 'smaa', 'tex_quality', 'fps', 'render_thread',
-                            'vertex_read', 'vk_prof', 'aspect', 'aspect_fill', 'movie_max', 'audout_ms',
+                            'vertex_read', 'tex_nocheck', 'astc_rt', 'collect', 'collect_delay',
+                            'aspect', 'aspect_fill', 'movie_max', 'audout_ms',
                             'movie_audio', 'volume', 'reverb'];
     try {
       let txt = '';
@@ -375,7 +713,9 @@ struct Index {
   }
 
   private fpsHint(on: boolean): string {
-    return on ? '60fps：只有菜单/标题更顺，世界和战斗更吃 GPU，建议关' : '30fps：游戏原生帧率，最稳（推荐）';
+    return on
+      ? '60fps：世界与菜单按 60 帧运行；战斗、捕捉等场景仍按游戏原始的 30 帧。这是游戏本身的设计（它的动画/逻辑按 33.3ms 步进），不是漏洞或渲染异常。'
+      : '30fps：游戏原生帧率，最稳、最省电（推荐）。';
   }
 
   private renderThreadHint(on: boolean): string {
@@ -862,36 +1202,102 @@ struct Index {
     padAxis(2, nearY * 32767);  // LEFTY（屏幕向下为正，游戏内 ly=-axis 恰好对应屏幕方向）
   }
 
+  // 全屏编辑器里的按键：长按拖动、右上角 X 隐藏/恢复（锁定的键没有 X）
   @Builder
-  padBtn(label: string, code: string, px: string, py: string) {
-    // 用 Stack 自绘按键（不用 Button：Button 内部点击手势会吞掉 onTouch 的 Up，
-    // 导致按住后无法抬起 → 游戏侧一直读到按下）。
-    // 按下时高亮（背景更亮、边框变蓝），松手复原——明确反馈按键是否生效。
+  padEditBtn(label: string, code: string) {
     Stack() {
       Text(label)
         .fontSize(18)
-        .fontColor(this.pressedCodes.includes(code) ? '#FFFFFF' : '#E6FFFFFF')
+        .fontColor(this.padCfg(code).on ? '#E6FFFFFF' : '#8B949E')
     }
-    .width(52)
-    .height(52)
-    .borderRadius(26)
-    .backgroundColor(this.pressedCodes.includes(code) ? '#B358A6FF' : '#40FFFFFF')
+    .width(52).height(52).borderRadius(26)
+    .backgroundColor(this.padCfg(code).on ? '#40FFFFFF' : '#1A000000')
     .border({
-      width: this.pressedCodes.includes(code) ? 2 : 1,
-      color: this.pressedCodes.includes(code) ? '#FF58A6FF' : '#60FFFFFF',
+      width: this.padHasConflict(code) ? 2 : 1,
+      color: this.padHasConflict(code) ? '#FF4D4F'
+        : (this.padCfg(code).on ? '#60FFFFFF' : '#8B949E'),
       radius: 26
     })
-    .position({ x: px, y: py })
+    .position({ x: this.padDrawX(code), y: this.padDrawY(code) })
     .hitTestBehavior(HitTestMode.Block)
-    .onTouch((e: TouchEvent) => {
-      if (e.type === TouchType.Down) {
-        if (!this.pressedCodes.includes(code)) { this.pressedCodes.push(code); }
-        this.sendPadDown(code);
-      } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
-        this.pressedCodes = this.pressedCodes.filter((c: string) => c !== code);
-        this.sendPadUp(code);
+    .onClick(() => {
+      if (this.padEditMode === 1) {
+        this.buzz();
+        this.padToggleVisible(code);
       }
     })
+    .gesture(
+      GestureGroup(GestureMode.Sequence,
+        LongPressGesture({ repeat: false, duration: 200 })
+          .onAction(() => {
+            if (this.padEditMode === 1) return;
+            this.buzz();
+            // 起点用配置坐标换算（不要用 padDrawX：那时 dragOn 还没置位）
+            this.startBX = this.padCfg(code).x * this.editW / 100;
+            this.startBY = this.padCfg(code).y * this.editH / 100;
+            this.dragX = this.startBX;
+            this.dragY = this.startBY;
+            this.dragCode = code;
+            this.dragOn = true;
+          }),
+        PanGesture({ fingers: 1, direction: PanDirection.All, distance: 1 })
+          .onActionUpdate((e: GestureEvent) => {
+            if (this.padEditMode === 1 || !this.dragOn) return;
+            // GestureEvent.offsetX/offsetY 的单位是 vp，和 position 一致 —— 不再做 px2vp 换算
+            this.dragX = Math.max(0, Math.min(this.editW - 52, this.startBX + e.offsetX));
+            this.dragY = Math.max(0, Math.min(this.editH - 52, this.startBY + e.offsetY));
+            this.dbgTouch = 'd=' + e.offsetX.toFixed(0) + ',' + e.offsetY.toFixed(0)
+              + '  btn=' + this.dragX.toFixed(0) + ',' + this.dragY.toFixed(0)
+              + '  edit=' + this.editW.toFixed(0) + ',' + this.editH.toFixed(0);
+          })
+          .onActionEnd(() => {
+            if (this.padEditMode === 1 || !this.dragOn) return;
+            this.padSet(code, this.dragX / this.editW * 100, this.dragY / this.editH * 100, this.padCfg(code).on);
+            this.dragCode = '';
+            this.dragOn = false;
+          })
+          .onActionCancel(() => {
+            this.dragCode = '';
+            this.dragOn = false;
+          })
+      )
+    )
+  }
+
+  @Builder
+  padBtn(label: string, code: string) {
+    // 用 Stack 自绘按键（不用 Button：Button 内部点击手势会吞掉 onTouch 的 Up，
+    // 导致按住后无法抬起 → 游戏侧一直读到按下）。
+    // 按下时高亮（背景更亮、边框变蓝），松手复原——明确反馈按键是否生效。
+    // 位置与显隐来自 pad_layout（在「操作方式」里配置），默认值见 padDefX/padDefY。
+    if (this.padCfg(code).on) {
+      Stack() {
+        Text(label)
+          .fontSize(18)
+          .fontColor(this.pressedCodes.includes(code) ? '#FFFFFF' : '#E6FFFFFF')
+      }
+      .width(52)
+      .height(52)
+      .borderRadius(26)
+      .backgroundColor(this.pressedCodes.includes(code) ? '#B358A6FF' : '#40FFFFFF')
+      .border({
+        width: this.pressedCodes.includes(code) ? 2 : 1,
+        color: this.pressedCodes.includes(code) ? '#FF58A6FF' : '#60FFFFFF',
+        radius: 26
+      })
+      .position({ x: this.padCfg(code).x + '%', y: this.padCfg(code).y + '%' })
+      .hitTestBehavior(HitTestMode.Block)
+      .onTouch((e: TouchEvent) => {
+        if (e.type === TouchType.Down) {
+          this.buzz();
+          if (!this.pressedCodes.includes(code)) { this.pressedCodes.push(code); }
+          this.sendPadDown(code);
+        } else if (e.type === TouchType.Up || e.type === TouchType.Cancel) {
+          this.pressedCodes = this.pressedCodes.filter((c: string) => c !== code);
+          this.sendPadUp(code);
+        }
+      })
+    }
   }
 
   // 虚拟手柄注入：code → SDL_GAMEPAD_BUTTON_* 索引（Switch/Xbox 布局）
@@ -1095,10 +1501,93 @@ struct Index {
     }
   }
 
+  // 按下反馈：30ms 短振。错误码 14600101 = Device operation failed：
+  // 官方可能原因包括「触觉管理开关关闭 / 设备被占用 / hdi 异常」。系统键盘能振说明开关是开的，
+  // 更可能是三方应用用 'touch' 场景被拦，所以这里按 usage 依次回退，直到有一个成功。
+  private lastBuzz: number = 0;
+  private buzzErrShown: boolean = false;
+  private buzzBest: number = 0;          // 上次成功的 usage 下标，下次优先用它
+
+  private buzzList(): string[] {
+    return ['physicalFeedback', 'notification', 'communication', 'touch', 'unknown'];
+  }
+
+  private buzz(): void {
+    const now: number = Date.now();
+    if (now - this.lastBuzz < 80) return;
+    this.lastBuzz = now;
+    this.buzzTry(this.buzzBest, 0);
+  }
+
+  private buzzTry(idx: number, depth: number): void {
+    const list: string[] = this.buzzList();
+    if (depth >= list.length) {
+      if (!this.buzzErrShown) {
+        this.buzzErrShown = true;
+        promptAction.showToast({ message: '振动不可用：所有场景都被系统拒绝（14600101）' });
+      }
+      return;
+    }
+    const i: number = (idx + depth) % list.length;
+    const u: vibrator.Usage = list[i] as vibrator.Usage;
+    vibrator.startVibration({ type: 'time', duration: 30 }, { id: 0, usage: u })
+      .then(() => {
+        this.buzzBest = i;
+      })
+      .catch((err: BusinessError) => {
+        this.buzzTry(idx, depth + 1);
+      });
+  }
+
+  private recFmt(): string {
+    const m: number = Math.floor(this.recSec / 60);
+    const s: number = this.recSec % 60;
+    return (m < 10 ? '0' : '') + m.toString() + ':' + (s < 10 ? '0' : '') + s.toString();
+  }
+
+  // 游戏内录制按钮（R 下方）：点一下开始，再点一下停止。
+  // 真正干活的是移植层的 las_collect_start/stop（已导出），这里只做闸门与计时显示。
+  private toggleRec(): void {
+    if (this.recOn) {
+      try {
+        stopCollect();   // 返回值是给日志看的英文摘要，这里不给用户看
+      } catch (e) {
+        // 运行时没加载时忽略
+      }
+      promptAction.showToast({ message: '已停止录制，数据已保存到 collect 目录' });
+      this.recOn = false;
+      this.recSec = 0;
+      if (this.recTimer >= 0) { clearInterval(this.recTimer); this.recTimer = -1; }
+      return;
+    }
+    try {
+      const rc: number = startCollect();
+      if (rc === 0 || rc === -2) {
+        this.recOn = true;
+        this.recSec = 0;
+        if (this.recTimer < 0) {
+          this.recTimer = setInterval(() => { this.recSec = this.recSec + 1; }, 1000);
+        }
+        promptAction.showToast({ message: rc === 0 ? '开始录制采集数据' : '已经在录制中' });
+      } else if (rc === -3) {
+        promptAction.showToast({ message: '游戏还没启动，进游戏后再点' });
+      } else {
+        promptAction.showToast({ message: '录制启动失败（错误 ' + rc.toString() + '）' });
+      }
+    } catch (e) {
+      promptAction.showToast({ message: '录制不可用：运行时尚未加载' });
+    }
+  }
+
   aboutToAppear(): void {
     this.checkDataReady();
     this.runProbe();
     this.runHmsProbe();
+    // 启动时就把上次保存的配置读进界面：改一次、保存一次，之后每次启动都沿用，
+    // 不用再进设置面板重设一遍。移植层本身也从 larecomp.ini 读，两边口径一致。
+    this.loadDisplaySettings();
+    this.loadGameSettings();
+    this.loadPadSettings();
   }
 
 build() {
@@ -1243,7 +1732,7 @@ build() {
           if (this.progress < 0) {
             LoadingProgress().width(48).height(48).color('#E53935')
             Text('正在处理，请保持应用在前台…')
-              .fontSize(12).fontColor('#8B949E')
+              .fontSize(11).fontColor('#8B949E')
           } else {
             Progress({ value: this.progress, total: 100, type: ProgressType.Linear })
               .width(420)
@@ -1293,32 +1782,37 @@ build() {
 
           // 漂浮层内容（每个按钮独立配置）
           if (this.overlayName === 'pad') {
-            Column({ space: 14 }) {
-              Text('虚拟按键体系').fontSize(13).fontColor('#8B949E').width('100%')
-              Row({ space: 12 }) {
-                Button('摇杆方向（默认）')
-                  .fontSize(14).height(48).layoutWeight(1)
+            Column({ space: 10 }) {
+              Row({ space: 6 }) {
+                Button('摇杆方向')
+                  .fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                   .backgroundColor(this.padMode === 'stick' ? '#E53935' : '#30363D')
-                  .onClick(() => { this.padMode = 'stick'; })
+                  .onClick(() => { this.padMode = 'stick'; this.iniWrite('pad_mode', 'stick'); })
                 Button('十字键方向')
-                  .fontSize(14).height(48).layoutWeight(1)
+                  .fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                   .backgroundColor(this.padMode === 'dpad' ? '#E53935' : '#30363D')
-                  .onClick(() => { this.padMode = 'dpad'; })
+                  .onClick(() => { this.padMode = 'dpad'; this.iniWrite('pad_mode', 'dpad'); })
               }
               .width('100%')
-              Text('摇杆方向：左半屏任意位置按下出现摇杆，拖动控制方向（王者式触点跟随）')
-                .fontSize(12).fontColor('#666D75').width('100%')
-              Text('十字键方向：左下十字键  ↑ ← → ↓  控制方向')
-                .fontSize(12).fontColor('#666D75').width('100%')
-              Text('右侧通用：ABXY · L/ZL/R/ZR · +/- · 半透明悬浮不挡视野')
-                .fontSize(12).fontColor('#666D75').width('100%')
+              Text('编辑该示例调整当前的按钮布局')
+                .fontSize(12).fontColor('#C9D1D9').width('100%')
+              Button('编辑按钮布局')
+                .fontSize(12).height(34).width('100%').fontColor('#FFFFFF').backgroundColor('#3B4CCA')
+                .onClick(() => { this.padOpenEditor(); })
+              Button('恢复默认布局')
+                .fontSize(10).height(30).width('100%').fontColor('#FFFFFF').backgroundColor('#30363D')
+                .onClick(() => { this.padResetAll(); })
+              Text('进入后两种模式：① 拖拽模式（长按拖动、松手固定，底部「保存按钮布局」退出）② 点顶部「隐藏 / 恢复」进入显隐模式，此时点按钮即切换、不能拖，点绿色「保存」结束。')
+                .fontSize(9).fontColor('#7D8590').width('100%')
+              Text('方向键（↑←→↓ / 摇杆两套）与 ABXY 不可隐藏——删了连走路和确认都做不到。')
+                .fontSize(9).fontColor('#D29922').width('100%')
             }
             .width('100%')
-            .padding({ top: 16 })
+            .padding({ top: 12 })
           } else if (this.overlayName === 'display') {
             Scroll() {
-              Column({ space: 10 }) {
-                Text('图形后端').fontSize(12).fontColor('#8B949E').width('100%')
+              Column({ space: 6 }) {
+                Text('图形后端').fontSize(11).fontColor('#8B949E').width('100%')
                 Text('Vulkan · ' + (this.deviceName.length > 0 ? this.deviceName : '当前设备 GPU'))
                   .fontSize(12).fontColor('#58A6FF').width('100%')
                 Button('套用性能优先设置')
@@ -1327,166 +1821,208 @@ build() {
                 Text('改成 720p / 动画540p / 双线性 / SMAA关 / 30fps / 渲染线程开 / 顶点拷贝 / 音频300ms；画面比例和音量不变')
                   .fontSize(10).fontColor('#666D75').width('100%')
 
-                Text('分辨率').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('分辨率').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('自动').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('自动').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor((!this.dsDynamic && this.dsRes === 0) ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = false; this.dsRes = 0; })
-                  Button('720p').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('720p').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor((!this.dsDynamic && this.dsRes === 720) ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = false; this.dsRes = 720; })
-                  Button('1080p').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('1080p').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor((!this.dsDynamic && this.dsRes === 1080) ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = false; this.dsRes = 1080; })
                 }
                 .width('100%')
                 Row({ space: 6 }) {
-                  Button('1440p').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('1440p').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor((!this.dsDynamic && this.dsRes === 1440) ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = false; this.dsRes = 1440; })
-                  Button('4K').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('4K').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor((!this.dsDynamic && this.dsRes === 2160) ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = false; this.dsRes = 2160; })
-                  Button('动态').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('动态').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsDynamic ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsDynamic = true; this.dsRes = 0; })
                 }
                 .width('100%')
                 Text(this.resHint(this.dsRes, this.dsDynamic))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('动画分辨率').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('动画分辨率').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('原生').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('原生').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsMovieRes === 0 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsMovieRes = 0; })
-                  Button('720p').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('720p').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsMovieRes === 720 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsMovieRes = 720; })
-                  Button('540p').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('540p').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsMovieRes === 540 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsMovieRes = 540; })
                 }
                 .width('100%')
                 Text(this.movieResHint(this.dsMovieRes))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('滤镜 / 上采样').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('滤镜 / 上采样').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('双线性').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('双线性').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsUpscaler === 'bilinear' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsUpscaler = 'bilinear'; })
-                  Button('锐化（FSR1）').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('锐化（FSR1）').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsUpscaler === 'fsr1' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsUpscaler = 'fsr1'; })
                 }
                 .width('100%')
                 Text(this.upscalerHint(this.dsUpscaler))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('抗锯齿').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('抗锯齿').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('关闭').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('关闭').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(!this.dsSmaa ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsSmaa = false; })
-                  Button('SMAA').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('SMAA').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsSmaa ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsSmaa = true; })
                 }
                 .width('100%')
                 Text(this.smaaHint(this.dsSmaa))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('画面比例').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('画面比例').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('原生 16:9').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('原生 16:9').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAspect === 'game' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAspect = 'game'; })
-                  Button('拉伸填充').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('拉伸填充').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAspect === 'fill' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAspect = 'fill'; })
-                  Button('4:3').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('4:3').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAspect === '43' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAspect = '43'; })
                 }
                 .width('100%')
                 Text(this.aspectHint(this.dsAspect))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('帧率').fontSize(12).fontColor('#8B949E').width('100%')
-                Row({ space: 6 }) {
-                  Button('30 fps').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
-                    .backgroundColor(!this.dsFps60 ? '#E53935' : '#30363D')
-                    .onClick(() => { this.dsFps60 = false; })
-                  Button('60 fps（实验）').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
-                    .backgroundColor(this.dsFps60 ? '#E53935' : '#30363D')
-                    .onClick(() => { this.dsFps60 = true; })
+                Row() {
+                  Text('帧率').fontSize(11).fontColor('#8B949E')
+                  Blank()
+                  Text(this.dsFps60 ? '60 fps' : '30 fps')
+                    .fontSize(10).fontColor(this.dsFps60 ? '#3FB950' : '#8B949E')
+                  Toggle({ type: ToggleType.Switch, isOn: this.dsFps60 })
+                    .selectedColor('#E53935')
+                    .width(44).height(24)
+                    .margin({ left: 8 })
+                    .onChange((on: boolean) => { this.dsFps60 = on; })
                 }
                 .width('100%')
                 Text(this.fpsHint(this.dsFps60))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor(this.dsFps60 ? '#7D8590' : '#7D8590').width('100%')
+                if (this.dsFps60) {
+                  Text('说明：只在世界和菜单生效，战斗/捕捉保持 30 帧 —— 游戏自身设计，请勿当作异常反馈。')
+                    .fontSize(9).fontColor('#D29922').width('100%')
+                }
 
-                Text('渲染线程').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('渲染线程').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('开启').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('开启').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsRenderThread ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsRenderThread = true; })
-                  Button('关闭').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('关闭').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(!this.dsRenderThread ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsRenderThread = false; })
                 }
                 .width('100%')
                 Text(this.renderThreadHint(this.dsRenderThread))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('顶点读取').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('顶点读取').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('自动').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('自动').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsVertexRead === 'auto' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsVertexRead = 'auto'; })
-                  Button('拷贝').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('拷贝').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsVertexRead === 'copy' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsVertexRead = 'copy'; })
-                  Button('直读').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('直读').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsVertexRead === 'direct' ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsVertexRead = 'direct'; })
                 }
                 .width('100%')
                 Text(this.vertexReadHint(this.dsVertexRead))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('帧时间诊断').fontSize(12).fontColor('#8B949E').width('100%')
-                Row({ space: 6 }) {
-                  Button('关闭').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
-                    .backgroundColor(!this.dsVkProf ? '#E53935' : '#30363D')
-                    .onClick(() => { this.dsVkProf = false; })
-                  Button('开启').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
-                    .backgroundColor(this.dsVkProf ? '#E53935' : '#30363D')
-                    .onClick(() => { this.dsVkProf = true; })
+                Row() {
+                  Text('ASTC 转码').fontSize(11).fontColor('#8B949E')
+                  Blank()
+                  Text(this.dsAstcRt ? '开（BC→ASTC）' : '关（BC→RGBA）')
+                    .fontSize(10).fontColor(this.dsAstcRt ? '#8B949E' : '#D29922')
+                  Toggle({ type: ToggleType.Switch, isOn: this.dsAstcRt })
+                    .selectedColor('#E53935')
+                    .width(44).height(24)
+                    .margin({ left: 8 })
+                    .onChange((on: boolean) => { this.dsAstcRt = on; })
                 }
                 .width('100%')
-                Text(this.vkProfHint(this.dsVkProf))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                Text(this.dsAstcRt
+                  ? '开：解码后再转成 ASTC 上传（省显存/带宽，多一次编码，默认）。'
+                  : '关：解码后直接上传 RGBA8（少一层 CPU，但纹理体积大 2~8 倍）。')
+                  .fontSize(9).fontColor(this.dsAstcRt ? '#7D8590' : '#D29922').width('100%')
+
+                Row() {
+                  Text('纹理校验').fontSize(11).fontColor('#8B949E')
+                  Blank()
+                  Text(this.dsTexCheck ? '开（哈希/比较）' : '关（直接输出）')
+                    .fontSize(10).fontColor(this.dsTexCheck ? '#8B949E' : '#D29922')
+                  Toggle({ type: ToggleType.Switch, isOn: this.dsTexCheck })
+                    .selectedColor('#E53935')
+                    .width(44).height(24)
+                    .margin({ left: 8 })
+                    .onChange((on: boolean) => { this.dsTexCheck = on; })
+                }
+                .width('100%')
+                Text(this.dsTexCheck
+                  ? '开：每帧检测动态纹理内容是否变化（默认，正确但吃 CPU）。'
+                  : '关：跳过哈希与比较，动态纹理每帧直接重传（更快，但可能更吃带宽）。')
+                  .fontSize(9).fontColor(this.dsTexCheck ? '#7D8590' : '#D29922').width('100%')
+
+                Row() {
+                  Text('数据采集').fontSize(11).fontColor('#8B949E')
+                  Blank()
+                  Text(this.dsCollect ? '开（游戏内可录制）' : '关')
+                    .fontSize(10).fontColor(this.dsCollect ? '#3FB950' : '#8B949E')
+                  Toggle({ type: ToggleType.Switch, isOn: this.dsCollect })
+                    .selectedColor('#E53935')
+                    .width(44).height(24)
+                    .margin({ left: 8 })
+                    .onChange((on: boolean) => { this.dsCollect = on; })
+                }
+                .width('100%')
+                Text('打开后：游戏里 R 键下方出现「录制」按钮，点它开始计时、再点一次停止。每次录制新建 collect/<时间>/（perf.csv / frame.csv）。关掉则不出现按钮、也不产生数据。')
+                  .fontSize(9).fontColor(this.dsCollect ? '#3FB950' : '#7D8590').width('100%')
 
                 Text('SMAA / FSR1 在部分 Maleoon 驱动上可能创建失败；保守使用「双线性 + 关闭 SMAA」。')
                   .fontSize(10).fontColor('#666D75').width('100%')
 
                 Divider().color('#30363D').width('100%').margin({ top: 4, bottom: 4 })
                 Text('音频').fontSize(13).fontColor('#FFFFFF').width('100%')
-                Text('动画音频').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('动画音频').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('开启').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('开启').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsMovieAudio ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsMovieAudio = true; })
-                  Button('关闭').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('关闭').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(!this.dsMovieAudio ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsMovieAudio = false; })
                 }
                 .width('100%')
                 Text(this.movieAudioHint(this.dsMovieAudio))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('主音量').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('主音量').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 8 }) {
                   Slider({ value: this.dsVolume, min: 0, max: 100, step: 5, style: SliderStyle.OutSet })
                     .layoutWeight(1)
@@ -1497,55 +2033,55 @@ build() {
                 }
                 .width('100%')
                 Text('主音量：影响游戏和动画音量；100% 为原始音量')
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('音频缓冲').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('音频缓冲').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('100ms').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('100ms').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAudoutMs === 100 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAudoutMs = 100; })
-                  Button('200ms').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('200ms').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAudoutMs === 200 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAudoutMs = 200; })
-                  Button('300ms').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('300ms').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsAudoutMs === 300 ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsAudoutMs = 300; })
                 }
                 .width('100%')
                 Text(this.audoutHint(this.dsAudoutMs))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
-                Text('混响').fontSize(12).fontColor('#8B949E').width('100%')
+                Text('混响').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
-                  Button('开启').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('开启').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsReverb ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsReverb = true; })
-                  Button('关闭').fontSize(11).height(36).layoutWeight(1).fontColor('#FFFFFF')
+                  Button('关闭').fontSize(10).height(30).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(!this.dsReverb ? '#E53935' : '#30363D')
                     .onClick(() => { this.dsReverb = false; })
                 }
                 .width('100%')
                 Text(this.reverbHint(this.dsReverb))
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
                 Text('输出通道：OHAudio（系统默认设备，当前唯一）')
                   .fontSize(10).fontColor('#666D75').width('100%')
 
                 Text('设置写入 larecomp.ini，下次「开始游戏」生效')
                   .fontSize(10).fontColor('#666D75').width('100%').margin({ top: 4 })
                 Button('保存并关闭')
-                  .fontSize(13).height(42).width('100%').fontColor('#FFFFFF').backgroundColor('#E53935')
+                  .fontSize(13).height(38).width('100%').fontColor('#FFFFFF').backgroundColor('#E53935')
                   .onClick(() => { this.saveDisplaySettings(); this.overlayName = ''; })
               }
               .width('100%')
               .padding({ top: 12, bottom: 4 })
             }
-            .height(220)
+            .height(360)
             .width('100%')
             .scrollBar(BarState.Off)
           } else if (this.overlayName === 'game') {
             Scroll() {
-              Column({ space: 10 }) {
-                Text('游戏语言').fontSize(12).fontColor('#8B949E').width('100%')
+              Column({ space: 6 }) {
+                Text('游戏语言').fontSize(11).fontColor('#8B949E').width('100%')
                 Row({ space: 6 }) {
                   Button('English').fontSize(10).height(36).layoutWeight(1).fontColor('#FFFFFF')
                     .backgroundColor(this.dsLang === 'en-US' ? '#E53935' : '#30363D')
@@ -1583,18 +2119,18 @@ build() {
                 }
                 .width('100%')
                 Text('游戏内文本按此语言加载，需重新开始游戏生效（游戏本体是否响应取决于游戏资源）')
-                  .fontSize(10).fontColor('#7D8590').width('100%')
+                  .fontSize(9).fontColor('#7D8590').width('100%')
 
                 Text('设置写入 larecomp.ini，下次「开始游戏」生效')
                   .fontSize(10).fontColor('#666D75').width('100%').margin({ top: 4 })
                 Button('保存并关闭')
-                  .fontSize(13).height(42).width('100%').fontColor('#FFFFFF').backgroundColor('#E53935')
+                  .fontSize(13).height(38).width('100%').fontColor('#FFFFFF').backgroundColor('#E53935')
                   .onClick(() => { this.saveGameSettings(); this.overlayName = ''; })
               }
               .width('100%')
               .padding({ top: 12, bottom: 4 })
             }
-            .height(220)
+            .height(360)
             .width('100%')
             .scrollBar(BarState.Off)
           } else if (this.overlayName === 'about') {
@@ -1616,7 +2152,106 @@ build() {
         .position({ x: '11%', y: '14%' })
       }
 
-      // ⑤ 游戏中虚拟按键层（running）
+      // ④b 全屏按钮布局编辑器（半黑遮罩，像进了游戏）
+      if (this.padEdit) {
+        Stack() {
+          Column()
+            .width('100%')
+            .height('100%')
+            .backgroundColor('#B0000000')
+          // 所有按键（隐藏的也画出来，红边 + 绿色 X，点 X 即恢复）
+          // 摇杆模式下方向不需要设置：左半屏任意位置按下就出现摇杆（王者式触点跟随），
+          // 所以这里不画十字键；只有切到「十字键方向」才需要摆这 4 个键。
+          if (this.padMode === 'dpad') {
+            this.padEditBtn('↑', 'up')
+            this.padEditBtn('←', 'left')
+            this.padEditBtn('→', 'right')
+            this.padEditBtn('↓', 'down')
+          }
+          this.padEditBtn('X', 'x')
+          this.padEditBtn('Y', 'y')
+          this.padEditBtn('B', 'b')
+          this.padEditBtn('A', 'a')
+          this.padEditBtn('L', 'l')
+          this.padEditBtn('ZL', 'zl')
+          this.padEditBtn('R', 'r')
+          this.padEditBtn('ZR', 'zr')
+          this.padEditBtn('+', 'start')
+          this.padEditBtn('－', 'select')
+          // 顶部中间：模式切换按钮。
+          //  模式 0（拖拽）：蓝底「隐藏 / 恢复」→ 点它进入隐藏恢复模式
+          //  模式 1（隐藏恢复）：绿底「保存」→ 点它保存显隐结果并回到拖拽模式
+          Row({ space: 10 }) {
+            Button(this.padEditMode === 1 ? '保存' : '隐藏 / 恢复')
+              .fontSize(12).height(34).width(150).fontColor('#FFFFFF')
+              .backgroundColor(this.padEditMode === 1 ? '#2EA043' : '#3B4CCA')
+              .onClick(() => {
+                if (this.padEditMode === 1) {
+                  this.iniWrite('pad_mode', this.padMode);
+                  this.iniWrite('pad_layout', this.padLayout);
+                  this.padEditMode = 0;
+                  promptAction.showToast({ message: '显示/隐藏已保存，回到拖拽模式' });
+                } else {
+                  this.padEditMode = 1;
+                }
+              })
+          }
+          .width('100%')
+          .justifyContent(FlexAlign.Center)
+          .hitTestBehavior(HitTestMode.None)   // 只让中间的按钮接收触摸，别挡住顶部那排 L/ZL/R/ZR/+/-（否则它们拖不动）
+          .position({ x: 0, y: '2%' })
+
+          Text(this.padEditMode === 1
+            ? '隐藏/恢复模式：点一下按钮即可切换；此模式不能拖动。点上方绿色「保存」完成。'
+            : '拖拽模式：长按 0.2 秒拖动，松手固定；此模式不能隐藏/恢复。点上方「隐藏 / 恢复」切换。')
+            .fontSize(11).fontColor('#B0FFFFFF')
+            .position({ x: '14%', y: '8%' })
+            .hitTestBehavior(HitTestMode.None)
+          Text(this.padMode === 'stick'
+            ? '摇杆方向：方向键不需要设置（左半屏任意位置按下即出现摇杆）'
+            : '十字键方向：可拖动 ↑ ← → ↓ 调整位置')
+            .fontSize(10).fontColor('#8B949E')
+            .position({ x: '26%', y: '12%' })
+            .hitTestBehavior(HitTestMode.None)
+
+          Text(this.dbgTouch)
+            .fontSize(9).fontColor('#58A6FF')
+            .position({ x: '2%', y: '93%' })
+            .hitTestBehavior(HitTestMode.None)
+          // 拖拽模式下才显示「保存按钮布局」；进入隐藏恢复模式时它暂时消失。
+          if (this.padEditMode === 0) {
+            Row() {
+              Button('保存按钮布局')
+                .fontSize(13).height(40).width(180)
+                .fontColor('#FFFFFF')
+                .backgroundColor(this.padAnyConflict() ? '#484F58' : '#E53935')
+                .enabled(!this.padAnyConflict())
+                .onClick(() => { this.padSaveEditor(); })
+            }
+            .width('100%')
+            .justifyContent(FlexAlign.Center)
+            .hitTestBehavior(HitTestMode.None)   // 同上：不能挡住底部的 A / ↓ 键
+            .position({ x: 0, y: '90%' })
+            if (this.padAnyConflict()) {
+              Text('按钮重叠了（红圈标出），请先分开再保存')
+                .fontSize(10).fontColor('#FF4D4F')
+                .position({ x: '38%', y: '96%' })
+                .hitTestBehavior(HitTestMode.None)
+            }
+          }
+        }
+        .width('100%')
+        .height('100%')
+        .onAreaChange((oldArea: Area, newArea: Area) => {
+          // 用编辑器自身实测尺寸（vp），比 display 推算可靠：容器可能被内边距/安全区裁过
+          const w: number = Number(newArea.width);
+          const h: number = Number(newArea.height);
+          if (w > 0 && h > 0) {
+            this.editW = w;
+            this.editH = h;
+          }
+        })
+      }
       if (this.dataState === 'running') {
         // 右上角帧率
         Text(this.fpsText)
@@ -1640,24 +2275,41 @@ build() {
           }
         } else {
           // 十字键（左下）：▲上 / ◀ ● ▶ / ▼下
-          this.padBtn('↑', 'up', '14%', '62%')
-          this.padBtn('←', 'left', '4%', '74%')
-          this.padBtn('→', 'right', '24%', '74%')
-          this.padBtn('↓', 'down', '14%', '86%')
+          this.padBtn('↑', 'up')
+          this.padBtn('←', 'left')
+          this.padBtn('→', 'right')
+          this.padBtn('↓', 'down')
         }
         // ABXY（右下）：X上 / Y左 B右 / A下
-        this.padBtn('X', 'x', '76%', '62%')
-        this.padBtn('Y', 'y', '66%', '74%')
-        this.padBtn('B', 'b', '86%', '74%')
-        this.padBtn('A', 'a', '76%', '86%')
+        this.padBtn('X', 'x')
+        this.padBtn('Y', 'y')
+        this.padBtn('B', 'b')
+        this.padBtn('A', 'a')
         // 肩键（上角）
-        this.padBtn('L', 'l', '4%', '6%')
-        this.padBtn('ZL', 'zl', '12%', '6%')
-        this.padBtn('R', 'r', '88%', '6%')
-        this.padBtn('ZR', 'zr', '80%', '6%')
+        this.padBtn('L', 'l')
+        this.padBtn('ZL', 'zl')
+        this.padBtn('R', 'r')
+        this.padBtn('ZR', 'zr')
+        // 录制按钮：R 正下方。开启「数据采集」闸门后才出现；点一下开始计时，再点一下停止。
+        if (this.dsCollect) {
+          Stack() {
+            Text(this.recOn ? ('REC ' + this.recFmt()) : '录制')
+              .fontSize(this.recOn ? 12 : 13)
+              .fontColor('#FFFFFF')
+          }
+          .height(30)
+          .constraintSize({ minWidth: 64 })
+          .padding({ left: 10, right: 10 })
+          .borderRadius(15)
+          .backgroundColor(this.recOn ? '#E53935' : '#70000000')
+          .border({ width: 1, color: this.recOn ? '#FF8A80' : '#60FFFFFF', radius: 15 })
+          .position({ x: '84%', y: '19%' })
+          .hitTestBehavior(HitTestMode.Block)
+          .onClick(() => { this.toggleRec(); })
+        }
         // 菜单键（上中）
-        this.padBtn('+', 'start', '76%', '30%')
-        this.padBtn('－', 'select', '18%', '30%')
+        this.padBtn('+', 'start')
+        this.padBtn('－', 'select')
         // 退出提示（不挡触控）
         Text('＋/－ 退出菜单会崩溃，请用系统手势退出')
           .fontSize(10).fontColor('#80FFFFFF')

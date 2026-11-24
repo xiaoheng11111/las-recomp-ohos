@@ -12,6 +12,13 @@
     "deliveryWithInstall": true,
     "installationFree": false,
     "pages": "$profile:main_pages",
+    "requestPermissions": [
+      {
+        "name": "ohos.permission.VIBRATE",
+        "reason": "$string:module_desc",
+        "usedScene": { "abilities": ["EntryAbility"], "when": "inuse" }
+      }
+    ],
     "abilities": [
       {
         "name": "EntryAbility",

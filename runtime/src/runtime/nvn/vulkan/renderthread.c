@@ -84,6 +84,18 @@ static void run(Job *j) {
     }
 }
 
+// ★ v17.6 防死锁：所有"等渲染线程/等票号"的地方都加一个上限。
+//   正常情况永远走不到这个分支（渲染线程每次都会在几毫秒内推进），
+//   只在"等了很久还没有结果"时打一行日志并放行，避免整个进程永久卡住。
+//   为什么必须放行而不是继续等：卡死时 GPU 已空闲（submitted==completed），
+//   出问题的是线程间协作，继续等只会永远卡住。
+#define RT_WAIT_TIMEOUT_MS 8000
+static uint64_t rt_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)ts.tv_nsec / 1000000ull;
+}
+
 static void *render_main(void *arg) {
     (void)arg;
     on_render_thread = true;
@@ -151,8 +163,15 @@ void rt_present(NvnTexture *t) {
     if (!t) return;
     if (!rt_active()) { backend_present(t); return; }
     pthread_mutex_lock(&lk);
-    while (pres_enq - pres_fin >= MAX_PRESENTS)
+    uint64_t _t2 = rt_now_ms();
+    while (pres_enq - pres_fin >= MAX_PRESENTS) {
         if (!wait_done()) { pthread_mutex_unlock(&lk); return; }
+        if (rt_now_ms() - _t2 > RT_WAIT_TIMEOUT_MS) {
+            LOG("[rt] present slot wait timed out (%llu pending) - releasing\n",
+                (unsigned long long)(pres_enq - pres_fin));
+            break;
+        }
+    }
     pres_enq++;
     pthread_mutex_unlock(&lk);
     Job j = {.kind = RJ_PRESENT, .tex = t};
@@ -170,7 +189,18 @@ void rt_call(void (*fn)(void *), void *arg) {
     Job j = {.kind = RJ_CALL, .fn = fn, .arg = arg, .done = &done};
     if (!push(j)) { return; }  // (a reboot: the call is dropped with the guest thread's work)
     pthread_mutex_lock(&lk);
-    while (!done) pthread_cond_wait(&c_done, &lk);  // (the render thread never waits for the game: this ends)
+    uint64_t _t3 = rt_now_ms();
+    while (!done) {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 5000000;
+        if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&c_done, &lk, &ts);
+        if (rt_now_ms() - _t3 > RT_WAIT_TIMEOUT_MS) {
+            LOG("[rt] rt_call timed out - returning without the render thread\n");
+            break;
+        }
+    }
     pthread_mutex_unlock(&lk);
 }
 
@@ -179,8 +209,14 @@ void rt_drain(void) {
     if (!rt_active() || on_render_thread) return;
     pthread_mutex_lock(&lk);
     uint64_t target = enq;
-    while (fin < target)
+    uint64_t _t1 = rt_now_ms();
+    while (fin < target) {
         if (!wait_done()) break;
+        if (rt_now_ms() - _t1 > RT_WAIT_TIMEOUT_MS) {
+            LOG("[rt] drain timed out (%llu jobs behind)\n", (unsigned long long)(target - fin));
+            break;
+        }
+    }
     pthread_mutex_unlock(&lk);
 }
 
@@ -195,8 +231,15 @@ uint64_t rt_fence_ticket(void) {
 void rt_wait_ticket(uint64_t ticket) {
     if (!ticket) return;
     pthread_mutex_lock(&lk);
-    while (fin < ticket)
+    uint64_t _t0 = rt_now_ms();
+    while (fin < ticket) {
         if (!wait_done()) { pthread_mutex_unlock(&lk); return; }
+        if (rt_now_ms() - _t0 > RT_WAIT_TIMEOUT_MS) {
+            LOG("[rt] wait_ticket %llu timed out (%llu jobs behind) - releasing\n",
+                (unsigned long long)ticket, (unsigned long long)(ticket - fin));
+            break;
+        }
+    }
     uint64_t seq = seq_after[ticket & 1023];
     pthread_mutex_unlock(&lk);
     renderer_wait_seq(seq);

@@ -295,7 +295,28 @@ uint32_t *vk_glsl_to_spirv(const char *src, int stage, const char *name, size_t 
     shaderc_compile_options_release(o);
     if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success) {
         static int nlog;
-        if (nlog++ < 20) LOG("[shader] %s: GLSL compile failed:\n%s\n%s\n", name, shaderc_result_get_error_message(r), effective_src);
+        // v10 诊断：以前这里把「整个 shader 源码」打出来（几十~数百行 × 20 次），本身也是日志洪水来源；
+        //   改成只打「头部 4 行」——关键看 #version 是否真的在第一行（glslang 报
+        //   "not supported with this profile: unknown profile" 时的常见原因就是版本头没被识别）。
+        if (nlog++ < 20) {
+            char head[320];
+            size_t hn = 0;
+            const char *p = effective_src;
+            int lines = 0;
+            while (p && *p && lines < 4 && hn + 1 < sizeof head) {
+                head[hn++] = *p;
+                if (*p == '\n') lines++;
+                p++;
+            }
+            head[hn] = 0;
+            LOG("[shader] %s: GLSL compile failed:\n%s\n--- 源码头部4行 ---\n%s--- 头部结束 ---\n",
+                name, shaderc_result_get_error_message(r), head);
+        }
+        // OHOS 诊断：统计失败总数，避免「失败被静默跳过 → 只剩清屏色」无从察觉
+        static int nfail;
+        nfail++;
+        if (nfail <= 3) LOG("[shader] COMPILE-FAIL #%d name=%s stage=%d\n", nfail, name, stage);
+        else if ((nfail % 16) == 0) LOG("[shader] COMPILE-FAIL total=%d (最新 %s)\n", nfail, name);
     } else {
         size_t n = shaderc_result_get_length(r);
         out = malloc(n);

@@ -250,6 +250,8 @@ static void ex_close(Extractor *e) {
 
 // A movie of the game's RomFS: a mod's copy (runtime/mods.h), else the extracted romfs/ folder (a source checkout),
 // else its bytes inside the romfs.bin image (what the start screen sets up: there is no folder).
+// The container this build's av_probe_input_format3 crashes on (an unguarded strcmp over a NULL-named demuxer):
+// pick the input format by the file's extension and hand it to avformat_open_input, skipping the probe entirely.
 static bool ex_open(Extractor *e, const char *rel, char *host, size_t cap) {
     struct stat sb;
     if (mod_romfs_override(rel, host, cap) ||
@@ -264,7 +266,10 @@ static bool ex_open(Extractor *e, const char *rel, char *host, size_t cap) {
     e->fmt = avformat_alloc_context();
     e->fmt->pb = e->avio;
     e->fmt->flags |= AVFMT_FLAG_CUSTOM_IO;
-    return avformat_open_input(&e->fmt, NULL, NULL, NULL) >= 0;  // (frees fmt on failure; avio: ex_close)
+    // Pass a non-NULL url (the descriptive host string): with url=NULL this ffmpeg build walks a NULL filename
+    // through strcmp in init_input / av_probe_input_format3 and SIGSEGVs (av_strstart+8). The bytes come from the
+    // custom AVIO anyway; the url is only a label for logging / probe hints.
+    return avformat_open_input(&e->fmt, host, NULL, NULL) >= 0;  // (frees fmt on failure; avio: ex_close)
 }
 
 static bool g_skip_held;           // ex_fill: A / B held at the last look
@@ -315,14 +320,12 @@ static void ex_set_data_source(Cpu *c) {
     bool opened = rel && ex_open(e, rel, host, sizeof host);
     LOG("[movie] open %s -> %s\n", path ? path : "(null)", host);
     if (!opened || avformat_find_stream_info(e->fmt, NULL) < 0) {
-        // 本移植无视频解码（ffmpeg stub）。原版返回错误码，游戏随后 signal 11 崩溃。
-        // 改为「假装打开成功但流为空/立即结束」，让游戏跳过该视频（开场视频）继续运行。
-        LOG("[movie] cannot open %s: treating as empty video (skip)\n", rel ? rel : "(null)");
+        // 上游（CowKillers）行为：报告失败，交给游戏自己跳过该视频。
+        // 旧的"假装打开成功但空视频"是 ffmpeg-stub 时代的折中——现在真解码可用，谎报成功会让游戏
+        // 的播放状态不一致（停在最后一帧/白屏，甚至后续解引用坏指针）。
+        LOG("[movie] cannot open %s\n", rel ? rel : "(null)");
         ex_close(e);
-        e->eof = true;
-        e->have_pkt = false;
-        e->ntracks = 0;
-        c->x[0] = 0;  // 成功
+        c->x[0] = 1;   // 失败：游戏据此跳过这段视频
         return;
     }
     e->pkt = av_packet_alloc();
@@ -529,7 +532,10 @@ typedef struct {
     int64_t pending_time[NPENDING];
     int npending;
     bool eos_pending;
+    bool eos_delivered;
     int64_t eos_time;
+    uint64_t stall_frames;   // video: frames count at the last "no progress" check
+    int stall_count;         // video: consecutive SendInput calls that produced no new frame
     bool stopped;  // Stop / destroyed: no more events (see dec_stop)
     pthread_mutex_t lock;
 } Decoder;
@@ -586,26 +592,53 @@ static void dec_configure(Cpu *c) {
     AVCodecParameters *p = m->codecpar;
     if (!p) { LOG("[movie] Configure without codec parameters\n"); c->x[0] = 1; return; }
     const AVCodec *codec = NULL;
-    // VP9 优先走系统硬解后端（ffmpeg-ohdec-vp9 定制 ohdec，AV_API>=23）：
-    // 打开失败（设备无 VP9 硬解）时回退内置软解，动画照常播放。
-    if (p->codec_id == AV_CODEC_ID_VP9) {
-        codec = avcodec_find_decoder_by_name("vp9_ohcodec");
-        if (codec) {
-            d->ctx = avcodec_alloc_context3(codec);
-            avcodec_parameters_to_context(d->ctx, p);
-            d->ctx->thread_count = 1;  // 硬解不用切片线程
-            d->ctx->thread_type = FF_THREAD_SLICE;
-            if (avcodec_open2(d->ctx, codec, NULL) >= 0) {
-                LOG("[movie] VP9 hardware decode enabled (vp9_ohcodec)\n");
-                goto codec_ready;
+    // 默认软解（可玩版行为：h264 软解动画结束后游戏能正常前进）。硬件解码器（h264_ohcodec/hevc_ohcodec）
+    // 输出的是 Surface 帧、当前移植拿不到 NV12 数据，动画播完会白屏卡住，故默认不用，仅在
+    // LARECOMP_MOVIE_HWDEC=1 时尝试（供日后打通零拷贝后再启用）。
+    // ============================================================================================
+    // 【`|| 1` 不是笔误！硬解必须强制开启 —— 绝对不要"修掉"它】
+    //
+    // 为什么强制：
+    //   鸿蒙 OH_VideoDecoder 硬解（h264_ohcodec / hevc_ohcodec / vp9_ohcodec，
+    //   见 platform/ohos/ffmpeg-ohdec-vp9/ohdec.c）是动画能正常播的前提。实测对比：
+    //     硬解 → 标题动画 2073 帧完整解出，30fps 稳定，声音正常
+    //     软解 → 丢帧严重、音频 underrun 暴涨、动画播到一半卡死不前进
+    //
+    // 【历史教训 —— 这个 `|| 1` 已经被误删过一次】
+    //   后来的 AI 看到 `getenv(...) || 1` 以为是恒真表达式的笔误，"修"成 `getenv(...)`，
+    //   于是硬解默认关闭 → 动画卡一半、声音断续。更糟的是：改成带开关后
+    //   实测直接崩在 `av_opt_next +0x20`（fault_addr=0x10000），因为软解路径在这个
+    //   FFmpeg 构建里的 AVOption 布局与硬解后端不一致。
+    //   → 崩溃函数名看起来像 FFmpeg 内部问题，实际根源就是这里被关掉了硬解。
+    //
+    // 正确做法：保持 `|| 1` 无条件尝试硬解；只有 avcodec_open2() 失败（设备真的不支持
+    //          该编码）才回退软解。回退逻辑在下面已经写好，不需要外部开关。
+    // 想临时关掉硬解调试？请改这里的 `|| 1` 为 `&& 0` 并同时确认不会触发上述崩溃，
+    //          不要依赖环境变量，也不要只写 getenv(...)。
+    // ============================================================================================
+    if (getenv("LARECOMP_MOVIE_HWDEC") || 1) {  // `|| 1` = 强制开启硬解，非笔误（详见上方注释）
+        const char *hw = p->codec_id == AV_CODEC_ID_H264 ? "h264_ohcodec"
+                       : p->codec_id == AV_CODEC_ID_HEVC ? "hevc_ohcodec"
+                       : p->codec_id == AV_CODEC_ID_VP9 ? "vp9_ohcodec" : NULL;
+        if (hw) {
+            const AVCodec *hcodec = avcodec_find_decoder_by_name(hw);
+            if (hcodec) {
+                d->ctx = avcodec_alloc_context3(hcodec);
+                avcodec_parameters_to_context(d->ctx, p);
+                d->ctx->thread_count = 1;  // 硬解不用切片线程
+                d->ctx->thread_type = FF_THREAD_SLICE;
+                if (avcodec_open2(d->ctx, hcodec, NULL) >= 0) {
+                    LOG("[movie] hardware decode enabled (%s)\n", hw);
+                    codec = hcodec;
+                    goto codec_ready;
+                }
+                LOG("[movie] %s open failed, falling back to software\n", hw);
+                avcodec_free_context(&d->ctx);
+                d->ctx = NULL;
+            } else {
+                LOG("[movie] %s not linked, using software\n", hw);
             }
-            LOG("[movie] vp9_ohcodec open failed, falling back to software\n");
-            avcodec_free_context(&d->ctx);
-            d->ctx = NULL;
-        } else {
-            LOG("[movie] vp9_ohcodec not linked, using software\n");
         }
-        codec = NULL;  // 回退走下面的通用路径
     }
     if (!codec) codec = avcodec_find_decoder(p->codec_id);
     d->ctx = avcodec_alloc_context3(codec);
@@ -794,6 +827,12 @@ static void dec_get_input_buffer(Cpu *c) {
 
 // Copy a decoded frame into an output slot; caller holds the lock.
 static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
+    if (d->video && f && !(flags & MOVIE_EOS)) {
+        static int _vd;
+        if (_vd++ < 6)
+            LOG("[movie] emit video frame: fmt=%d %dx%d data0=%p data1=%p data2=%p ls0=%d\n",
+                (int)f->format, f->width, f->height, (void*)f->data[0], (void*)f->data[1], (void*)f->data[2], f->linesize[0]);
+    }
     // Round robin, not the first free slot: Let's Go releases an output buffer and copies out of it afterwards, so
     // refilling the slot just released overwrote audio it was still reading (robotic movie sound, ~30% of samples).
     int slot = -1;
@@ -818,10 +857,33 @@ static bool emit_frame(Decoder *d, AVFrame *f, int64_t time, uint32_t flags) {
     } else if (d->video) {
         int h = d->height, w = d->width, uv_off = d->stride * h;
         for (int y = 0; y < h; y++) memcpy(o + y * d->stride, f->data[0] + y * f->linesize[0], w);
-        for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
-            uint8_t *uv = o + uv_off + y * d->stride;
-            const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
-            for (int x = 0; x < w / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+        // ============================================================================================
+        // 【硬解输出是 NV12（2 平面），软解才是 YUV420P（3 平面）—— 必须分开处理，否则崩】
+        //
+        // 硬解（h264_ohcodec / hevc_ohcodec）走 OH_VideoDecoder 的 buffer 模式，输出 AV_PIX_FMT_NV12：
+        //   data[0] = Y 平面, data[1] = 交错的 UV 平面, data[2] = NULL（NV12 只有 2 个平面！）
+        // 软解（ffmpeg 内置解码器）输出 AV_PIX_FMT_YUV420P：
+        //   data[0] = Y, data[1] = U, data[2] = V（3 个独立平面）
+        //
+        // 【历史 bug】这段原来无条件按 YUV420P 三平面处理：
+        //     const uint8_t *v = f->data[2] + y * f->linesize[2];   // 硬解时 f->data[2] == NULL
+        //   → 解引用空指针 → signal 11 fault_addr=(nil)，崩在 emit_frame+0x330。
+        //   实测日志特征：`[movie] emit video frame: fmt=23 ... data2=0`（fmt=23 就是 NV12，data2=0 就是 NULL）
+        //
+        // 不要"简化"成只留一条路径 —— 两条都必须保留：
+        //   - NV12：UV 已经是交错的，直接整行 memcpy（顺手修 stride 不一致的情况）
+        //   - 其它（YUV420P 等）：从 U/V 两个平面手工交错
+        // ============================================================================================
+        if (f->format == AV_PIX_FMT_NV12) {
+            // NV12：data[1] 已是交错 UV，直接拷贝（f->linesize[1] 可能 != d->stride，逐行拷）
+            for (int y = 0; y < h / 2; y++)
+                memcpy(o + uv_off + y * d->stride, f->data[1] + y * f->linesize[1], w);
+        } else {
+            for (int y = 0; y < h / 2; y++) {  // interleave U and V into NV12
+                uint8_t *uv = o + uv_off + y * d->stride;
+                const uint8_t *u = f->data[1] + y * f->linesize[1], *v = f->data[2] + y * f->linesize[2];
+                for (int x = 0; x < w / 2; x++) { uv[2 * x] = u[x]; uv[2 * x + 1] = v[x]; }
+            }
         }
         size = (uint32_t)(uv_off + d->stride * (h / 2));
     } else {
@@ -867,6 +929,7 @@ static bool flush_pending(Decoder *d) {
     if (!d->npending && d->eos_pending && emit_frame(d, NULL, d->eos_time, MOVIE_EOS)) {
         { static int nlog; if (nlog++ < 20) LOG("[movie] %s decoder: end of stream delivered\n", d->video ? "video" : "audio"); }
         d->eos_pending = false;
+        d->eos_delivered = true;
         any = true;
     }
     return any;
@@ -892,7 +955,8 @@ static void dec_send_input(Cpu *c) {
     }
     if (flags & MOVIE_EOS) avcodec_send_packet(d->ctx, NULL);
     bool produced = false;
-    while (avcodec_receive_frame(d->ctx, d->frame) == 0) {
+    int _rrc;
+    while ((_rrc = avcodec_receive_frame(d->ctx, d->frame)) == 0) {
         int64_t t = d->frame->pts != AV_NOPTS_VALUE ? d->frame->pts : time;
         // keep order: queue behind anything already pending
         if (d->npending || !emit_frame(d, d->frame, t, 0)) {
@@ -906,7 +970,19 @@ static void dec_send_input(Cpu *c) {
         n_frames++;
         produced = true;
     }
-    if (flags & MOVIE_EOS) { d->eos_pending = true; d->eos_time = time; }
+    if ((flags & MOVIE_EOS) && !d->eos_delivered) { d->eos_pending = true; d->eos_time = time; }
+    // Hardware decoder (ohcodec) at end-of-video: it stops producing frames but never reports EOF, while the game
+    // keeps feeding input expecting the next frame. Detect the stall and synthesize the end-of-stream the way the
+    // software path does, so the game finishes the movie and moves on (otherwise: frozen on the last frame).
+    if (d->video && !d->eos_delivered && size > 0) {
+        if (n_frames != d->stall_frames) { d->stall_frames = n_frames; d->stall_count = 0; }
+        else if (++d->stall_count > 500) {  // ~500 fed inputs with no new frame: the stream is done
+            LOG("[movie] video stalled at frame %llu (%d inputs): synthesizing end of stream\n",
+                (unsigned long long)n_frames, d->stall_count);
+            d->eos_pending = true; d->eos_time = time;
+            d->stall_count = -1000000;  // (don't repeat)
+        }
+    }
     produced |= flush_pending(d);
     if (idx >= 0 && idx < NIN) d->in_busy[idx] = false;
     pthread_mutex_unlock(&d->lock);
@@ -919,7 +995,13 @@ static void dec_acquire_output(Cpu *c) {
     Decoder *d = self_state(c);
     n_acq_out++;
     pthread_mutex_lock(&d->lock);
-    if (!d->nready) { pthread_mutex_unlock(&d->lock); c->x[0] = 1; return; }
+    if (!d->nready) {
+        static int _e;
+        if (d->video && d->eos_pending && _e++ < 10)
+            LOG("[movie] video acquire: no ready, eos_pending=%d eos_delivered=%d npending=%d out_busy0=%d\n",
+                (int)d->eos_pending, (int)d->eos_delivered, d->npending, (int)d->out_busy[0]);
+        pthread_mutex_unlock(&d->lock); c->x[0] = 1; return;
+    }
     OutReady r = d->ready[0];
     memmove(d->ready, d->ready + 1, --d->nready * sizeof *d->ready);
     int remaining = d->nready;

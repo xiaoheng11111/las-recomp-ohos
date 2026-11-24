@@ -117,7 +117,31 @@ NVN(nvnQueueSubmitCommands) {
     for (int i = 0; i < n; i++) rt_submit(handles[i]);
 }
 NVN(nvnQueueFlush) { (void)c; }
-NVN(nvnQueueFinish) { (void)c; rt_drain(); renderer_sync(); }
+NVN(nvnQueueFinish) {
+    (void)c;
+    // ★ v14 采集：统计游戏主动 finish 的次数。
+    //
+    //   【为什么这一项是 v14 的核心】
+    //     v13 数据发现 in_flight_max 稳恒为 1（62/63 窗口，in_flight_end 100% 为 1），
+    //     GPU/CPU 完全串行。但要判断"能不能改"，必须先知道串行是谁造成的：
+    //       · 如果这个计数高（比如每帧 1 次）-> 游戏主动要求同步，
+    //         这是 NVN 契约（nvnQueueFinish 语义就是"立即完成"），我们改不了。
+    //       · 如果这个计数很低，但 renderer_sync_cnt 高 -> 串行是我们自己造成的，能改。
+    //
+    //   【为什么计数放在这里而不是 renderer_sync 里】
+    //     renderer_sync() 被很多地方调用（包括这个函数）。如果只在 sync 里计，
+    //     就分不清"是游戏要求的"还是"我们内部的"。必须在 NVN 边界处单独计。
+    //
+    //   【为什么不用原子操作】
+    //     nvnQueueFinish 来自游戏线程，同一时刻只有一个游戏线程；
+    //     累加和读取最坏差一两次计数，对"高/低"的判断毫无影响。
+    //     而 _Atomic 的 ++ 在 ARM64 上约 15ns，这里虽然不在最热路径，
+    //     但也没必要为它付这个代价（每帧最多几次）。
+    extern uint64_t g_nvn_queue_finish_cnt;
+    g_nvn_queue_finish_cnt++;
+    rt_drain();
+    renderer_sync();
+}
 
 static NvnSync *sync_of(uint64_t guest) {
     NvnSync *s = HOST(NvnSync, guest);
@@ -320,13 +344,64 @@ static void builder_layout(uint64_t b, TexLayout *t) {
     if (!t->layers) t->layers = 1;
     t->levels = G(uint32_t, b, 0x1C) ? G(uint32_t, b, 0x1C) : 1;
     tegra_layout_init(t);
-    // Packaged textures (BNTX) were swizzled offline with their own block height, which can differ
-    // from the driver default: NVNpackagedTextureLayout's low word is log2(GOBs per block).
+    // Packaged (BNTX) textures. NVNpackagedTextureLayout is an 8-byte opaque struct (h1k421's nvn.h:
+    // `unsigned char layout[8]`). Its layout, measured in nxnative's rendering notes:
+    //   byte 0 low 4 bits  = log2(GOBs per block) for level 0
+    //   byte 0 high 4 bits = log2(block depth) (3D textures)
+    //   byte 1 low 4 bits  = log2(width alignment in GOBs); levels at least one tile
+    //                        (that many GOBs wide, one block high and deep) are padded to whole
+    //                        tiles, smaller levels form the mip tail; 0 = no alignment.
+    //   (Bayonetta Origins' 2052x1026 ASTC 6x6 card: byte 0 = 3, width nibble = 4.)
+    //
+    // ★ 旧实现 `if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;` 是错的：
+    //   它把整个低 32 位当 block height。只要 byte 1 的 width nibble 非 0（pl >= 0x100），
+    //   `<= 5` 就整条拒绝 —— 这些纹理退回默认规则，而且 width alignment 从未被应用，
+    //   于是「从第二个块行起」整片错位。这正是 UI 图标 / 横幅装饰 / 路牌花屏的真正来源，
+    //   也是 v4 只改默认 block-height 规则修不好它们的原因（图标根本走的是这条覆盖分支）。
     uint64_t pl = G(uint64_t, b, 0x50);
-    if (pl && (uint32_t)pl <= 5) t->block_height_log2 = (uint32_t)pl;
-    if (pl && getenv("LARECOMP_LOG_PACKAGED")) {
-        static int n;
-        if (n++ < 4000) LOG("[nvn] packaged layout %016llx fmt %#x %ux%u lv %u -> default bh %u\n", pl, G(uint32_t, b, 0x20), t->width, t->height, t->levels, t->block_height_log2);
+    static int pkg_legacy = -1;
+    if (pkg_legacy < 0) {
+        const char *e = getenv("LARECOMP_PKG_PARSE");
+        pkg_legacy = (e && !strcmp(e, "legacy")) ? 1 : 0;
+    }
+    uint32_t bh_new = t->block_height_log2, bd_new = t->block_depth_log2, wa_new = 0;
+    if (pl) {
+        if (pkg_legacy) {
+            // 旧行为（对照用）：整个低 32 位当 bh，<=5 才接受，无 width alignment。
+            if ((uint32_t)pl <= 5) { bh_new = (uint32_t)pl; t->block_height_log2 = bh_new; }
+        } else {
+            uint32_t pbh = (uint32_t)(pl & 0xF);
+            uint32_t pbd = (uint32_t)((pl >> 4) & 0x3);
+            wa_new = (uint32_t)((pl >> 8) & 0xF);
+            if (pbh <= 4) { t->block_height_log2 = pbh; bh_new = pbh; }
+            if (pbd <= 3) { t->block_depth_log2 = pbd; bd_new = pbd; }
+            // LARECOMP_PKG_NO_WA=1 → 只修 block height、先不应用宽度对齐（二分用）。
+            if (!getenv("LARECOMP_PKG_NO_WA") && wa_new) t->packaged_width_log2 = wa_new;
+        }
+    }
+    // 诊断：默认限流 300 条；LARECOMP_PKG_LOG=1（或旧的 LARECOMP_LOG_PACKAGED）放开到 4000 条。
+    {
+        static int nb, n_pkg, n_wa, n_rej, n_last;
+        static int unlimited = -1;
+        if (unlimited < 0) unlimited = (getenv("LARECOMP_PKG_LOG") || getenv("LARECOMP_LOG_PACKAGED")) ? 1 : 0;
+        if (pl) {
+            n_pkg++;
+            if (wa_new) n_wa++;
+            if (!pkg_legacy && (uint32_t)(pl & 0xF) > 4) n_rej++;
+            if ((unlimited && nb < 4000) || nb < 300) {
+                LOG("[nvn-pkg] layout=%016llx byte0=%02x(bh=%u bd=%u) byte1=%02x(wa=%u) fmt=%#x %ux%u lv %u "
+                    "target %u flags=%#x -> bh %u bd %u wa %u\n",
+                    (unsigned long long)pl, (unsigned)(pl & 0xFF), (unsigned)(pl & 0xF), (unsigned)((pl >> 4) & 0x3),
+                    (unsigned)((pl >> 8) & 0xFF), (unsigned)wa_new,
+                    G(uint32_t, b, 0x20), t->width, t->height, t->levels, G(uint32_t, b, 0xC), G(uint32_t, b, 8),
+                    t->block_height_log2, t->block_depth_log2, t->packaged_width_log2);
+                nb++;
+            }
+            if (n_pkg - n_last >= 512) {
+                n_last = n_pkg;
+                LOG("[nvn-pkg] totals: %d layouts, %d with wa!=0, %d bh rejected\n", n_pkg, n_wa, n_rej);
+            }
+        }
     }
 }
 
@@ -496,7 +571,7 @@ NVN(nvnTextureWriteTexels) {
     LevelLayout l = tegra_level(&t->layout, 0);
     if (r && r[0] == 0 && r[1] == 0 && (uint32_t)r[3] == t->width && (uint32_t)r[4] == t->height) {
         tegra_swizzle(AP(3), (uint8_t *)(uintptr_t)t->addr + l.offset, l.wb, l.hb, r[5] > 0 ? (uint32_t)r[5] : 1,
-                      t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2);
+                      t->layout.fmt->bpb, l.block_height_log2, l.block_depth_log2, t->layout.packaged_width_log2);
         backend_pool_written(t->addr, tegra_total_size(&t->layout));
     } else {
         LOG("[nvn] partial WriteTexels not implemented\n");

@@ -20,6 +20,22 @@
 #include "vk.h"
 #include "../output_scale.h"
 #include "../renderer.h"
+// 游戏内数据采集（逐帧 hook）。头文件里说明了为什么不能复用下面的
+// LARECOMP_FRAMETIME_CSV，以及为什么这里是唯一的逐帧采集点。
+#include "las_collect.h"
+
+// ============================================================================
+// ★ v13：交换链 / 帧并行度统计 —— 变量声明（定义在本文件靠后，但这里必须先声明）
+// ----------------------------------------------------------------------------
+// 【为什么变量声明放在文件这么靠前】
+//   present_mode()（约第 900 行）和 create_swapchain()（约第 1020 行）要写这两个值，
+//   而它们的完整定义（含 las_vkstat_read 等函数）放在 FRAMES 附近（约第 1090 行）。
+//   C 语言没有前向引用，所以「会被早期代码写入的变量」必须在这里先声明。
+//   函数（las_vkstat_read / on_submit / on_complete）在文件后部定义，
+//   调用方都在其后，不需要前向声明。
+// ============================================================================
+static volatile int las_sw_images = -1;          // 交换链图数（-1=未知）
+static volatile int las_sw_present_mode = -1;    // 0=FIFO 1=MAILBOX 2=IMMEDIATE（-1=未知）
 
 VkG g_vk;
 static SDL_Window *window;
@@ -677,16 +693,53 @@ static void create_device(void) {
     const char *ext[8];
     uint32_t n_ext = 0;
     ext[n_ext++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
-    // 二分排查 vkCreateDevice -3：可选扩展全部关闭（只留 swapchain）
-    g_vk.custom_border = false;
-    g_vk.divisor = false;
-    g_vk.host_import = false;
-    bool fault = false;
+    // 恢复官方逻辑：按驱动实际支持的扩展逐个开启（此前二分排查时被强行关闭，
+    // 导致 host_import 恒为 false → 只能走 gcopy → guest heap 读不到 → 顶点/常量全 0 → 蓝屏）
+    g_vk.custom_border = has_ext(ep, ne, VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
+    if (g_vk.custom_border) ext[n_ext++] = VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME;
+    g_vk.divisor = has_ext(ep, ne, VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME);
+    if (g_vk.divisor) ext[n_ext++] = VK_EXT_VERTEX_ATTRIBUTE_DIVISOR_EXTENSION_NAME;
+    g_vk.host_import = has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    if (g_vk.host_import) ext[n_ext++] = VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME;
+    bool fault = has_ext(ep, ne, VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (fault) ext[n_ext++] = VK_EXT_DEVICE_FAULT_EXTENSION_NAME;
     // LARECOMP_PIPE_STATS: what the driver says about each compiled shader (registers, spills, ...), exec.c pipe_exec_report
     g_pipe_exec_stats = getenv("LARECOMP_PIPE_STATS") && has_ext(ep, ne, VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME);
     if (g_pipe_exec_stats) ext[n_ext++] = VK_KHR_PIPELINE_EXECUTABLE_PROPERTIES_EXTENSION_NAME;
     else if (getenv("LARECOMP_PIPE_STATS")) LOG("[vk] LARECOMP_PIPE_STATS: the driver has no VK_KHR_pipeline_executable_properties\n");
     g_fault_ext = fault;
+    // v10【A/B 开关 + 版本指纹】两件事：
+    //   1) LARECOMP_NO_EXT=1：强制关闭本轮重编后才「真正启用」的驱动扩展（custom_border / divisor /
+    //      host_import），等价回到 v8 旧 .o 的行为。用途：隔离「v9 户外变慢(17fps) + 建筑变白板」
+    //      是否由这些扩展被真正启用引入；默认不设 = 不改变 v9 的任何行为。
+    //   2) BUILD TAG：以后判断设备上装的是哪个版本不再靠猜（日志标记 + .so 大小/md5 双指纹）。
+    {
+        static int no_ext = -1;
+        if (no_ext < 0) no_ext = getenv("LARECOMP_NO_EXT") ? 1 : 0;
+        if (no_ext) { g_vk.custom_border = 0; g_vk.divisor = 0; g_vk.host_import = 0; }
+        // v11：把三个扩展的「最终是否启用」一并打印（远景：v9 起建筑白板的二分需要知道边界布尔值，
+        //      以前只能从代码推断；现在日志一条就够）。no_ext=1 时三者被强制归零。
+        LOG("[vk] BUILD TAG: perf-v11 (shaderc-patched) compiled " __DATE__ " " __TIME__ " no_ext=%d border=%d divisor=%d import=%d\n",
+            no_ext, g_vk.custom_border, g_vk.divisor, g_vk.host_import);
+    }
+    // ============================================================================================
+    // v9 诊断：一次性记录「决定优化方向的三项驱动能力」——只是打日志，不改变任何行为。
+    //   1) external_memory_host：决定顶点/常量能否零拷贝直接读 guest 堆（不支持就只能逐帧 memcpy）。
+    //      （历史 [gcopy] 日志显示本机疑似不支持；这次直接把枚举结果打出来，避免再靠推断。）
+    //   2) push_descriptor：决定能否用 vkCmdPushDescriptorSetKHR 替代「每 draw 一次
+    //      vkAllocateDescriptorSets + vkUpdateDescriptorSets」（室外重场景 sets 约占 11ms/帧 CPU）。
+    //   3) ASTC 4x4 采样能力：决定 BC 纹理能否转码成 ASTC 压缩采样（RGBA8 的 1/4 带宽）。
+    // ============================================================================================
+    LOG("[vk] 扩展支持: external_memory_host=%d push_descriptor=%d host_image_copy=%d memory_budget=%d renderpass2=%d sync2_ext=%d\n",
+        has_ext(ep, ne, VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME), has_ext(ep, ne, "VK_KHR_push_descriptor"),
+        has_ext(ep, ne, "VK_EXT_host_image_copy"), has_ext(ep, ne, "VK_EXT_memory_budget"),
+        has_ext(ep, ne, "VK_KHR_create_renderpass2"), has_ext(ep, ne, "VK_KHR_synchronization2"));
+    {
+        VkFormatProperties fp;
+        vkGetPhysicalDeviceFormatProperties(g_vk.phys, VK_FORMAT_ASTC_4x4_UNORM_BLOCK, &fp);
+        LOG("[vk] ASTC 4x4 UNORM 格式能力: optimal=0x%x linear=0x%x buffer=0x%x（采样需要 optimal 含 SAMPLED_IMAGE_BIT=0x1）\n",
+            fp.optimalTilingFeatures, fp.linearTilingFeatures, fp.bufferFeatures);
+    }
     free(ep);
 
     // features the backend relies on (all present on current desktop drivers).
@@ -699,6 +752,40 @@ static void create_device(void) {
     VkPhysicalDeviceFeatures2 have = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, .pNext = &have13};
     vkGetPhysicalDeviceFeatures2(g_vk.phys, &have);
     LOG("[vk] features: dynamicRendering=%d sync2=%d maintenance4=%d shaderInt64=%d\n", have13.dynamicRendering, have13.synchronization2, have13.maintenance4, have.features.shaderInt64);
+    // ============================================================================================
+    // 【驱动兼容降级开关（对齐 Android v0128/v0129 的做法）—— 不要当成无用代码删掉】
+    //
+    // 为什么保留：
+    //   某些移动 GPU 驱动（含华为 Maleoon）会「声称」支持 dynamic rendering / synchronization2，
+    //   但在特定场景（游戏内菜单、场景转场、stencil 遮罩、多 pass 依赖）下才暴露实现缺陷：
+    //   表现为管线创建失败、画面错乱、或直接 SIGSEGV，且普通画面完全正常 —— 极难复现定位。
+    //   这两个开关让同一份 so 可以不重编就切到老路径验证，是排查这类问题的唯一手段。
+    //
+    // 用法（运行时环境变量，不需要重新编译）：
+    //   LARECOMP_NO_DYN_RENDER=1  强制关闭 dynamic rendering，改用 VkRenderPass + framebuffer
+    //   LARECOMP_NO_SYNC2=1       强制关闭 synchronization2，改用 Vulkan 1.0 的 barrier/submit
+    //   两个都设 = 最大兼容模式（帧率略降，但驱动走最成熟的路径）
+    //
+    // 【历史教训 —— 不要重犯】
+    //   1) 曾因为「没有任何日志输出」就断定开关没生效而删掉。实际上开关是惰性的：
+    //      只有设置了环境变量才打日志，默认不输出任何东西，这是刻意设计，不是坏了。
+    //   2) 崩溃时优先试这两个开关做二分：若 LARECOMP_NO_DYN_RENDER=1 就不崩，
+    //      说明是 dynamic rendering 路径的驱动缺陷；若 NO_SYNC2=1 才不崩，则是同步 2 的问题。
+    //      结论比对着源码猜快一个数量级。
+    //   3) 开关状态会写进 g_vk.dyn_render / g_vk.sync2，供 exec.c 里选择管线路径，
+    //      删字段会导致 exec.c 编译失败。
+    // 默认（不设环境变量）：完全按驱动上报的能力走，不做任何降级 —— 性能最好。
+    // ============================================================================================
+    bool force_no_dyn = getenv("LARECOMP_NO_DYN_RENDER") != NULL;
+    bool force_no_sync2 = getenv("LARECOMP_NO_SYNC2") != NULL;
+    if (force_no_dyn && have13.dynamicRendering)
+        LOG("[vk] dynamic rendering forced OFF (LARECOMP_NO_DYN_RENDER), using render-pass fallback\n");
+    if (force_no_sync2 && have13.synchronization2)
+        LOG("[vk] sync2 forced off (LARECOMP_NO_SYNC2): using 1.0 barriers/submit\n");
+    bool use_dyn = have13.dynamicRendering && !force_no_dyn;
+    bool use_sync2 = have13.synchronization2 && !force_no_sync2;
+    g_vk.dyn_render = use_dyn;
+    g_vk.sync2 = use_sync2;
     VkPhysicalDeviceVertexAttributeDivisorFeaturesEXT div = {
         .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_DIVISOR_FEATURES_EXT,
         .vertexAttributeInstanceRateDivisor = VK_TRUE, .vertexAttributeInstanceRateZeroDivisor = VK_FALSE};
@@ -707,8 +794,8 @@ static void create_device(void) {
         .customBorderColorWithoutFormat = VK_FALSE, .pNext = g_vk.divisor ? &div : NULL};  // 官方：仅请求支持的）
 
     VkPhysicalDeviceVulkan13Features f13 = {.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-                                            .dynamicRendering = have13.dynamicRendering,
-                                            .synchronization2 = have13.synchronization2,
+                                            .dynamicRendering = use_dyn,
+                                            .synchronization2 = use_sync2,
                                             .shaderDemoteToHelperInvocation = have13.shaderDemoteToHelperInvocation,
                                             .shaderTerminateInvocation = have13.shaderTerminateInvocation,
                                             .maintenance4 = have13.maintenance4,
@@ -831,7 +918,16 @@ static VkPresentModeKHR present_mode(void) {
     VkPresentModeKHR m[16];
     if (n > 16) n = 16;
     vkGetPhysicalDeviceSurfacePresentModesKHR(g_vk.phys, g_vk.surface, &n, m);
-    for (uint32_t i = 0; i < n; i++) if (m[i] == want) return want;
+    for (uint32_t i = 0; i < n; i++) if (m[i] == want) {
+        // ★ v13 采集：把最终生效的呈现模式记下来，供 las_vkstat_read 读走。
+        //   注意这里记的是「驱动真正支持的」那个值，不是我们请求的 ——
+        //   如果驱动不支持 MAILBOX 会被下面撞到 FIFO，那种情况必须记 0 才对。
+        las_sw_present_mode = (want == VK_PRESENT_MODE_MAILBOX_KHR) ? 1
+                            : (want == VK_PRESENT_MODE_IMMEDIATE_KHR) ? 2 : 0;
+        return want;
+    }
+    // 落到这里说明驱动不支持请求的模式，回退 FIFO
+    las_sw_present_mode = 0;
     return VK_PRESENT_MODE_FIFO_KHR;
 }
 
@@ -933,6 +1029,10 @@ static void create_swapchain(void) {
     g_vk.sc_extent = ext;
     g_vk.sc_count = 8;
     vkGetSwapchainImagesKHR(g_vk.dev, g_vk.swapchain, &g_vk.sc_count, g_vk.sc_images);
+    // ★ v13 采集：缓存交换链实际有多少张图。
+    //   判据：== 2 只够双缓冲容易卡；>= 3 才正常。
+    //   这里 g_vk.sc_count 已经是驱动真正返回的数量（上面先填 8 作为容量上限）。
+    las_sw_images = (int)g_vk.sc_count;
     for (uint32_t i = 0; i < g_vk.sc_count; i++) {
         VkImageViewCreateInfo vi = {.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO, .image = g_vk.sc_images[i],
                                     .viewType = VK_IMAGE_VIEW_TYPE_2D, .format = sf.format,
@@ -1010,6 +1110,182 @@ static void recover_lost_surface(void) {
     }
 }
 
+// ============================================================================
+// ★ v13：交换链 / 帧并行度统计（供游戏内采集器使用）
+// ----------------------------------------------------------------------------
+// 【为什么需要这个】
+//   上一轮 63.9 秒数据的反证：
+//     低帧窗口 draws=7059 < 正常窗口 11230，gpu_ms=511 < 729 ——
+//     工作量更少，帧率却更低。所以瓶颈不是"渲染太多"，而是"帧没并行起来"。
+//   要证明这一点，必须实测：能同时在飞几帧、每次 acquire/present/等 fence 阻塞多久。
+//
+// 【设计原则：只读 + 每窗口结算一次】
+//   - 所有计数器都是"累加"，由 las_vkstat_read() 读走之后清零（和 renderer_stats 同款语义）。
+//   - 计时用 SDL_GetTicksNS()，一次调用约 20~30ns，可忽略。
+//   - 任何一处没取到值就填 -1，绝不用 0 冒充真值（0 会被误读成"没阻塞"，那是错误结论）。
+//
+// 【各字段取数点（都在本文件内）】
+//   sw_images         <- create_swapchain() 里 vkGetSwapchainImagesKHR 之后的 g_vk.sc_count
+//   sw_present_mode   <- present_mode() 的返回值（缓存到静态变量）
+//   acq_block_ms      <- vkAcquireNextImageKHR 前后计时
+//   pres_block_ms     <- vkQueuePresentKHR 前后计时
+//   fence_wait_ms     <- 由 exec.c 的 vk_wait_seq 累加（那边才有 vkWaitSemaphores）
+//   in_flight_*       <- 提交 +1 / fence 完成 -1 的计数器
+// ============================================================================
+
+// 交换链创建时缓存的静态值（-1 = 还没建）
+// ★ 注意：las_sw_images / las_sw_present_mode 两个变量的声明在文件靠前处
+//   （present_mode() 和 create_swapchain() 需要写入它们，C 没有前向引用）。
+
+// 每个统计窗口累加的阻塞时长（纳秒）
+static _Atomic uint64_t las_acq_ns;      // vkAcquireNextImageKHR 阻塞
+static _Atomic uint64_t las_pres_ns;     // vkQueuePresentKHR 阻塞
+// fence 等待由 exec.c 的 vk_wait_seq 累加进来（那边才看得到 vkWaitSemaphores）
+// 用非 static 的全局，exec.c 用 extern 声明后直接累加，避免跨文件函数调用开销。
+_Atomic uint64_t las_fence_ns;
+
+// 在飞帧计数
+static _Atomic int las_inflight;         // 当前在飞（提交+1，fence 完成-1）
+static _Atomic int las_inflight_max;     // 本窗口峰值
+static _Atomic int las_submitted;        // 本窗口提交帧数
+// ★ v17：真实在飞帧数（submit_seq − timeline 已完成），以及按站点归因的等待统计。
+//   旧的两个指标（las_inflight_*）保留不删：老数据可比对，新数据以 truth 列为准。
+static _Atomic int las_inflight_true_max;
+static _Atomic int las_inflight_true_end;
+
+// 当前在飞帧数（给别处查询用；不改变计数）
+int las_vkstat_inflight_now(void) { return atomic_load(&las_inflight); }
+
+// 提交一帧（在 vkQueueSubmit 成功之后调用）
+void las_vkstat_on_submit(void) {
+    int v = atomic_fetch_add(&las_inflight, 1) + 1;
+    atomic_fetch_add(&las_submitted, 1);
+    // 更新峰值（CAS 循环，保证不丢最大值）
+    int prev = atomic_load(&las_inflight_max);
+    while (v > prev && !atomic_compare_exchange_weak(&las_inflight_max, &prev, v)) {
+        // prev 已被 CAS 更新为当前值，继续比较
+    }
+}
+
+// 一帧的 GPU 工作完成（在确认某个 submission 的 timeline 值已达成之后调用）
+void las_vkstat_on_complete(void) {
+    int v = atomic_load(&las_inflight);
+    if (v > 0) atomic_fetch_sub(&las_inflight, 1);
+}
+
+// 读走本窗口的统计并清零。任何一项没数据就写 -1。
+// ★ 参数全部是输出；调用方（las_collect.c）负责给结构体赋值。
+void las_vkstat_read(int *sw_images, int *sw_present_mode,
+                     double *acq_ms, double *pres_ms, double *fence_ms,
+                     int *in_flight_max, int *in_flight_end, int *frames_submitted,
+                     int *inflight_true_max, int *inflight_true_end,
+                     uint64_t *site_cnt, uint64_t *site_ns, uint64_t *nosub) {
+    if (sw_images)         *sw_images = las_sw_images;
+    if (sw_present_mode)   *sw_present_mode = las_sw_present_mode;
+    if (acq_ms)            *acq_ms = (double)atomic_exchange(&las_acq_ns, 0) / 1e6;
+    if (pres_ms)           *pres_ms = (double)atomic_exchange(&las_pres_ns, 0) / 1e6;
+    if (fence_ms)          *fence_ms = (double)atomic_exchange(&las_fence_ns, 0) / 1e6;
+    if (in_flight_max)     *in_flight_max = atomic_exchange(&las_inflight_max, atomic_load(&las_inflight));
+    if (in_flight_end)     *in_flight_end = atomic_load(&las_inflight);
+    if (frames_submitted)  *frames_submitted = atomic_exchange(&las_submitted, 0);
+    // ★ v17：真实在飞 + 站点归因（读走并清零，和上面同款语义）
+    if (inflight_true_max) *inflight_true_max = atomic_exchange(&las_inflight_true_max, atomic_load(&las_inflight_true_end));
+    if (inflight_true_end) *inflight_true_end = atomic_load(&las_inflight_true_end);
+    if (site_cnt) {
+        extern uint64_t g_vk_wait_site_cnt[VK_WAIT_SITE_COUNT];
+        for (int i = 0; i < VK_WAIT_SITE_COUNT; i++) site_cnt[i] = g_vk_wait_site_cnt[i];
+    }
+    if (site_ns) {
+        extern uint64_t g_vk_wait_site_ns[VK_WAIT_SITE_COUNT];
+        for (int i = 0; i < VK_WAIT_SITE_COUNT; i++) { site_ns[i] = g_vk_wait_site_ns[i]; g_vk_wait_site_ns[i] = 0; }
+    }
+    if (nosub) {
+        extern uint64_t g_vk_wait_nosub_cnt;
+        *nosub = g_vk_wait_nosub_cnt; g_vk_wait_nosub_cnt = 0;
+    }
+}
+
+// ============================================================================
+// ★ v13 D 组：附加计数（纹理上传 / 管线创建绑定 / 显存 / 超预算）
+// ----------------------------------------------------------------------------
+// 【为什么这些单独一组而不是并进 A 组】
+//   它们是"资源层"的量，和 A 组（交换链/并行）没有因果关系，
+//   分析时要分开看：A 组判"并行好不好"，D 组判"这一秒造了多少资源/浪费了多少时间"。
+// ============================================================================
+
+// 纹理上传（次数 + 字节）。由 textures.c 的上传路径累加。
+_Atomic uint64_t las_tex_upload_cnt;
+_Atomic uint64_t las_tex_upload_bytes;
+// 全量 hash 扫描次数（纹理审计路径）
+_Atomic uint64_t las_tex_hash_scans;
+// 管线创建 / 绑定
+_Atomic uint64_t las_pipe_create;
+_Atomic uint64_t las_pipe_bind;
+
+// 纹理上传计数（textures.c 调用）
+void las_vkstat_on_tex_upload(uint64_t bytes) {
+    atomic_fetch_add(&las_tex_upload_cnt, 1);
+    atomic_fetch_add(&las_tex_upload_bytes, bytes);
+}
+void las_vkstat_on_tex_hash_scan(void) { atomic_fetch_add(&las_tex_hash_scans, 1); }
+void las_vkstat_on_pipe_create(void)   { atomic_fetch_add(&las_pipe_create, 1); }
+void las_vkstat_on_pipe_bind(void)     { atomic_fetch_add(&las_pipe_bind, 1); }
+
+// 读走 D 组并清零。
+// ★ mem_used_mb 传 -1 表示"这一项取不到"（不是 0），分析时能区分。
+void las_vkstat_read_extra(uint64_t *tex_upload_cnt, double *tex_upload_bytes_mb,
+                           uint64_t *tex_view_create_cnt, uint64_t *tex_hash_scan_cnt,
+                           uint64_t *pipe_create_cnt, uint64_t *pipe_bind_cnt,
+                           double *mem_used_mb) {
+    if (tex_upload_cnt)     *tex_upload_cnt = atomic_exchange(&las_tex_upload_cnt, 0);
+    if (tex_upload_bytes_mb) *tex_upload_bytes_mb = (double)atomic_exchange(&las_tex_upload_bytes, 0) / 1048576.0;
+    if (tex_hash_scan_cnt)  *tex_hash_scan_cnt = atomic_exchange(&las_tex_hash_scans, 0);
+    if (pipe_create_cnt)    *pipe_create_cnt = atomic_exchange(&las_pipe_create, 0);
+    if (pipe_bind_cnt)      *pipe_bind_cnt = atomic_exchange(&las_pipe_bind, 0);
+    // tex_view_create_cnt 直接读已有的 prof_views_created（textures.c:1087 定义），
+    // 它是 v11 就有的计数器，由 renderer_stats 的采集 hook 读走，这里不再重复清零。
+    if (tex_view_create_cnt) {
+        extern uint64_t prof_views_created;
+        *tex_view_create_cnt = prof_views_created;
+    }
+    // 显存：用 VMA 的 heap budget。
+    //   为什么取不到就给 -1 而不是 0：0 会被误读成"没占显存"，那是错误结论。
+    //   vmaGetHeapBudgets 是 VMA 官方推荐的每帧可调用接口，开销可忽略。
+    //
+    // ★★ v14.1 修正一个真 bug（perf-optimizer2 从真机数据发现）★★
+    //   【现象】真机 csv 里 mem_used_mb 是 5.04e12 / 1.07e13 MB（5~10 万亿 MB）。
+    //   【根因】vmaGetHeapBudgets 只填 memoryHeapCount 个槽位
+    //          （VMA 头文件签名里写明 `VMA_LEN_IF_NOT_NULL("VkPhysicalDeviceMemoryProperties::memoryHeapCount")`），
+    //          而我原来遍历整个 VK_MAX_MEMORY_HEAPS(16) ——
+    //          超出 memoryHeapCount 的槽位【从未被写入】，读到的是栈上未初始化垃圾。
+    //          所以数值巨大且只在两个固定值之间跳（读到两块残留内存）。
+    //   【修法】先正确取 memoryHeapCount，只遍历真实存在的 heap。
+    //          怎么取：直接调 vkGetPhysicalDeviceMemoryProperties ——
+    //          它不在 g_vk 里（g_vk 只有 props，没有 memory properties），
+    //          但这是个标准 Vulkan 调用，每次读统计时才调一次（1Hz），开销可忽略。
+    //          不改 vk.h 结构体（符合最小动刀）。
+    //   【另一层防护】把整个 budgets 数组先清零：
+    //          万一驱动报告的 memoryHeapCount 比实际填充的多（不合规驱动），
+    //          清零后多读的槽位也是 0 而不是垃圾。双保险。
+    if (mem_used_mb) {
+        *mem_used_mb = -1.0;
+        if (g_vk.vma) {
+            VkPhysicalDeviceMemoryProperties mp;
+            vkGetPhysicalDeviceMemoryProperties(g_vk.phys, &mp);
+            uint32_t nheap = mp.memoryHeapCount;
+            if (nheap > VK_MAX_MEMORY_HEAPS) nheap = VK_MAX_MEMORY_HEAPS;  // 防御性钳制
+            if (nheap > 0) {
+                VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+                memset(budgets, 0, sizeof budgets);   // ★ 先清零，见上面【另一层防护】
+                vmaGetHeapBudgets(g_vk.vma, budgets);
+                uint64_t total = 0;
+                for (uint32_t i = 0; i < nheap; i++) total += budgets[i].usage;
+                *mem_used_mb = (double)total / 1048576.0;
+            }
+        }
+    }
+}
+
 // ================================================================== frames (start screen and game)
 // Acquire semaphores rotate per frame in flight; a slot is reused once the submission that waited on it is done.
 #define FRAMES 3
@@ -1083,8 +1359,13 @@ bool vk_frame_begin(const float clear[4]) {
     if (trace) LOG("[vk] frame begin %dx%d (swapchain %ux%u)\n", w, h, g_vk.sc_extent.width, g_vk.sc_extent.height);
     slot = (slot + 1) % FRAMES;
     if (!acquire_sem[slot]) acquire_sem[slot] = binary_semaphore();
-    vk_wait_seq(slot_seq[slot]);
+    vk_wait_seq_at(slot_seq[slot], VK_WAIT_SITE_FRAME_BEGIN);
+    // ★ v13 采集：vkAcquireNextImageKHR 的阻塞时长。
+    //   这里阻塞说明「交换链里没有空闲的图可用」——即呈现队列背压。
+    //   判据：acq_block_ms 高 => 交换链太浅 或 present 没跟上。
+    uint64_t _acq_t0 = SDL_GetTicksNS();
     VkResult r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
+    atomic_fetch_add(&las_acq_ns, SDL_GetTicksNS() - _acq_t0);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         recreate_swapchain();
         r = vkAcquireNextImageKHR(g_vk.dev, g_vk.swapchain, UINT64_MAX, acquire_sem[slot], VK_NULL_HANDLE, &cur_frame.image);
@@ -1185,9 +1466,35 @@ void vk_frame_end(const char *shot_path) {
     if (!done_sem[img]) done_sem[img] = binary_semaphore();
     uint64_t seq = vk_pending_seq();
     vk_submit_extra(cur_frame.acquired, done_sem[img], VK_NULL_HANDLE);
+    // ★ v13 采集：这一帧的 GPU 工作已提交，在飞帧 +1。
+    //   注意 vk_submit_extra 是真正 vkQueueSubmit 的地方（exec.c），
+    //   但那个函数被很多地方调用（纹理上传等），所以不能在那儿统一计数。
+    //   这里统计的是「呈现一帧」的提交，口径和 frames_submitted 对得上。
+    las_vkstat_on_submit();
+    // ★ v17：采样真实在飞帧数（已提交 − GPU 已完成）。
+    //   这是唯一能回答「GPU 同时有几帧在跑」的口径；旧的 las_inflight 结构上恒为 1。
+    //   ★ v17.1 成本修正：vk_inflight_true() 内含一次 vkGetSemaphoreCounterValue（驱动调用）。
+    //     绝不能每帧都做 —— 只在【采集开启】且【每 4 帧一次】采样，
+    //     否则生产构建会白白多付驱动往返，也是 v17 首轮数据 CPU 偏高的嫌疑之一。
+    {
+        extern int las_collect_is_active(void);
+        static unsigned tick;
+        if (las_collect_is_active() && (++tick & 3u) == 0) {
+            int t = vk_inflight_true();
+            atomic_store(&las_inflight_true_end, t);
+            int prev2 = atomic_load(&las_inflight_true_max);
+            while (t > prev2 && !atomic_compare_exchange_weak(&las_inflight_true_max, &prev2, t)) {
+            }
+        }
+    }
     VkPresentInfoKHR pi = {.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR, .waitSemaphoreCount = 1, .pWaitSemaphores = &done_sem[img],
                            .swapchainCount = 1, .pSwapchains = &g_vk.swapchain, .pImageIndices = &img};
+    // ★ v13 采集：vkQueuePresentKHR 的阻塞时长。
+    //   这里阻塞 = 呈现引擎背压（队列满 / 合成器慢）。
+    //   判据：pres_block_ms 高 => 呈现侧是瓶颈（不是渲染侧）。
+    uint64_t _pres_t0 = SDL_GetTicksNS();
     VkResult r = vkQueuePresentKHR(g_vk.queue, &pi);
+    atomic_fetch_add(&las_pres_ns, SDL_GetTicksNS() - _pres_t0);
     if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) recreate_swapchain();
     else if (r == VK_ERROR_SURFACE_LOST_KHR) recover_lost_surface();
     cur_frame.ok = false;
@@ -1254,7 +1561,7 @@ void vk_save_png(const char *path, const uint8_t *rgba, uint32_t w, uint32_t h) 
 extern void vk_present_draw(VkCommandBuffer cb, TexBackend *b, float bx, float by, float bw, float bh, float pw, float ph, const float pv[8]);
 void renderer_submit(void);
 void renderer_set_scale(float sx, float sy);
-uint64_t renderer_present_count(void);
+double renderer_last_gpu_ms(void);   // v17.1: exec.c, previous window's per-frame GPU ms (-1 = no sample)uint64_t renderer_present_count(void);
 void renderer_save_texture_tex(TexBackend *b, const char *path);
 
 static uint64_t frames, total_frames, g_frame_counter;
@@ -1351,9 +1658,10 @@ void backend_present(NvnTexture *t) {
         double dw = sideways ? g_vk.sc_extent.height : g_vk.sc_extent.width;
         double dh = sideways ? g_vk.sc_extent.width : g_vk.sc_extent.height;
         // render scale + placement in the window (the game's 16:9 image, fitted): runtime/nvn/output_scale.c;
-        // no GPU timer here (-1): dynamic resolution goes by the frame time
+        // ★ v17.1: was -1 (no GPU timer -> blind probing). Now the real per-frame GPU busy time is passed,
+        // so dynamic resolution raises only when the GPU actually has headroom (output_scale.c:58).
         OutScale os;
-        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, -1, &os);
+        output_scale(dw, dh, false, SDL_GetTicksNS() / 1e9, renderer_last_gpu_ms(), &os);
         double sx = os.sx, sy = os.sy, vx = os.vx, vy = os.vy, vw = os.vw, vh = os.vh;
         float box[4];  // the letterbox in swapchain-image coordinates
         present_box(dw, dh, vx, vy, vw, vh, box);
@@ -1411,6 +1719,36 @@ void backend_present(NvnTexture *t) {
     frames++;
     total_frames++;
     g_frame_counter++;
+    // ========================================================================
+    // ★ 游戏内采集：逐帧 hook
+    // ------------------------------------------------------------------------
+    // 【为什么必须放这里，而不是复用下面的 LARECOMP_FRAMETIME_CSV】
+    //   下面那段（原 1485 行起）确实也写逐帧 CSV，但它有三个硬伤，不能当采集用：
+    //     1) 路径靠环境变量 LARECOMP_FRAMETIME_CSV，而且 static 初始化只做一次
+    //        （fopen 只发生一次）。用户点按钮时游戏已经跑了几千帧，改环境变量无效；
+    //     2) 只有 "present,dt_ms" 两列，没有会话相对时间 t_ms，
+    //        没法跟 PERF / MARK 对齐；
+    //     3) 文件名在启动前就定死，拿不到运行时的时间戳做会话 ID。
+    //   所以逐帧数据由采集器自己写（las_collect_on_frame）。
+    //   下面那段原代码保留不动 —— 它是 opt-in 的，我们不设那个环境变量就不生效。
+    //
+    // 【为什么这一行是唯一的「真正逐帧」采集点】
+    //   renderer_stats() 被 fps_iv（当前 1.0 秒）节流，1 秒才跑一次，
+    //   所以 PERF 类拿不到逐帧信息。用户要定位「哪一帧卡」，只能在这里采。
+    //
+    // 【开销】
+    //   未开始采集时 las_collect_on_frame() 第一句就 return（一个 int 判断）。
+    //   采集时每帧一次 snprintf + fwrite 到 64KB 缓冲，约 1~2 微秒。
+    // ========================================================================
+    las_collect_on_frame(total_frames);
+    {
+        // ★ v17.5 卡死看门狗：与采集开关无关，任何一次运行都会生效。
+        //   原理：每帧更新 last_present；后台线程每秒检查一次，超过 3 秒没有新帧就落盘一份
+        //   freeze/<时间>.txt（含 submission 进度、最后 64 条 GPU 操作、各线程 state/wchan）。
+        //   自己读 /proc/self 不受 hidepid 限制，所以能拿到 hdc 拿不到的线程栈位置。
+        extern void vk_freeze_watch_frame(void);
+        vk_freeze_watch_frame();
+    }
     {   // Opt-in game-present intervals (not the extra menu image shown by the 60 fps mode).
         static FILE *csv;
         static uint64_t previous;
@@ -1524,9 +1862,15 @@ void backend_present(NvnTexture *t) {
             // 统计字符串生成很重：只在显式开启 prof 时打印（帧率更新本身不受影响）
             static int prof_on = -1;
             if (prof_on < 0) prof_on = getenv("LARECOMP_VK_PROF") != NULL;
+            // ★ v17.2：采集器（PERF 1Hz）的数据来自 renderer_stats() 的第一句 hook。
+            //   原来这里只在 prof_on（LARECOMP_VK_PROF）时才调用它 —— 界面把"帧诊断"关掉以后，
+            //   PERF 就整条停了（perf.csv 只有表头，0 行）。采集开启时无论如何都要调一次。
+            extern int las_collect_is_active(void);
             if (prof_on)
                 LOG("[vk] t=%.1f frame %llu %.1f fps max %.0fms (%s)\n", now, (unsigned long long)total_frames,
                     g_current_fps, g_frame_ms, renderer_stats());
+            else if (las_collect_is_active())
+                (void)renderer_stats();   // 只为触发采集 hook，字符串丢弃
         }
         max_gap = 0;
         frames = 0;
@@ -1639,3 +1983,111 @@ int ui_run(void) {
         menu_apply_window_requests(window);
     }
 }
+
+
+// ================================================================== v17.5 卡死看门狗
+// 与「数据采集」完全解耦：不依赖 collect 是否开启，也不需要用户点任何按钮。
+#include <dirent.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+static _Atomic uint64_t g_fw_last_ns;      // 最近一次出帧时刻
+static _Atomic int      g_fw_dumped;       // 是否已经写过一份
+static pthread_t        g_fw_thread;
+static volatile int     g_fw_started;
+
+// 逐帧调用：更新"最后一帧时刻"
+static void *vk_freeze_watch_main(void *arg);
+
+void vk_freeze_watch_frame(void) {
+    atomic_store(&g_fw_last_ns, (uint64_t)SDL_GetTicksNS());
+    g_fw_dumped = 0;
+    if (!g_fw_started) {           // 第一帧才起线程：此时 SDL 已初始化，Delay/Ticks 可用
+        g_fw_started = 1;
+        if (pthread_create(&g_fw_thread, NULL, vk_freeze_watch_main, NULL) != 0) g_fw_started = 0;
+    }
+}
+
+static void vk_freeze_report(void) {
+    const char *root = getenv("LARECOMP_DATA_ROOT");
+    if (!root || !*root) return;
+    char dir[700];
+    snprintf(dir, sizeof dir, "%s/freeze", root);
+    mkdir(dir, 0777);
+
+    char path[820];
+    int64_t sec = (int64_t)(SDL_GetTicks() / 1000);
+    snprintf(path, sizeof path, "%s/freeze_%lld.txt", dir, (long long)sec);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    uint64_t last = atomic_load(&g_fw_last_ns);
+    double stalled_ms = last ? (double)((uint64_t)SDL_GetTicksNS() - last) / 1e6 : -1.0;
+    fprintf(f, "LASRECOMP FREEZE REPORT\n");
+    fprintf(f, "stalled_ms=%.0f  (no new frame)\n", stalled_ms);
+    fprintf(f, "total_frames=%llu\n", (unsigned long long)total_frames);
+    fprintf(f, "g_current_fps=%.2f  g_frame_ms=%.1f\n", g_current_fps, g_frame_ms);
+    fprintf(f, "submitted_seq=%llu  completed_seq=%llu\n",
+            (unsigned long long)vk_submitted_seq(), (unsigned long long)vk_completed_seq());
+    {
+        extern uint64_t g_vk_wait_nosub_cnt;
+        extern uint64_t g_vk_wait_site_ns[VK_WAIT_SITE_COUNT];
+        fprintf(f, "wait_nosub_cnt=%llu\n", (unsigned long long)g_vk_wait_nosub_cnt);
+        for (int i = 0; i < VK_WAIT_SITE_COUNT; i++)
+            fprintf(f, "wait_site[%d]=%.1fms\n", i, (double)g_vk_wait_site_ns[i] / 1e6);
+    }
+    fprintf(f, "\n--- threads (tid comm state wchan) ---\n");
+    DIR *d = opendir("/proc/self/task");
+    if (d) {
+        struct dirent *e;
+        while ((e = readdir(d))) {
+            if (e->d_name[0] == '.') continue;
+            char sp[256], comm[64], st[4] = "?";
+            snprintf(sp, sizeof sp, "/proc/self/task/%s/stat", e->d_name);
+            FILE *sf = fopen(sp, "r");
+            if (!sf) continue;
+            char line[512];
+            if (fgets(line, sizeof line, sf)) {
+                char *lp = strchr(line, '('), *rp = strrchr(line, ')');
+                if (lp && rp && rp > lp) {
+                    size_t n = (size_t)(rp - lp - 1);
+                    if (n >= sizeof comm) n = sizeof comm - 1;
+                    memcpy(comm, lp + 1, n); comm[n] = 0;
+                    char *q = rp + 2;
+                    if (q[0]) { st[0] = q[0]; st[1] = 0; }
+                }
+            }
+            fclose(sf);
+            char wp[256], wchan[128] = "?";
+            snprintf(wp, sizeof wp, "/proc/self/task/%s/wchan", e->d_name);
+            FILE *wf = fopen(wp, "r");
+            if (wf) {
+                if (fgets(wchan, sizeof wchan, wf)) {
+                    size_t n = strlen(wchan);
+                    while (n && (wchan[n - 1] == '\n' || wchan[n - 1] == ' ')) wchan[--n] = 0;
+                }
+                fclose(wf);
+            }
+            fprintf(f, "%s %-28s state=%s wchan=%s\n", e->d_name, comm, st, wchan);
+        }
+        closedir(d);
+    }
+    fflush(f);
+    fclose(f);
+    LOG("[watchdog] freeze report written: %s (stalled %.0f ms)\n", path, stalled_ms);
+}
+
+static void *vk_freeze_watch_main(void *arg) {
+    (void)arg;
+    for (;;) {
+        SDL_Delay(1000);
+        uint64_t last = atomic_load(&g_fw_last_ns);
+        if (!last) continue;
+        if (atomic_load(&g_fw_dumped)) continue;
+        if ((double)((uint64_t)SDL_GetTicksNS() - last) / 1e6 < 1500.0) continue;
+        atomic_store(&g_fw_dumped, 1);
+        vk_freeze_report();
+    }
+    return NULL;
+}
+

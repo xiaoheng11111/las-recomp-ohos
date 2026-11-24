@@ -41,8 +41,9 @@ Settings g_settings = {
     .profile_world_aspect = PASP_GAME,
     .profile_battle_aspect = PASP_GAME,
     .tex_quality = 100,
-#ifdef __ANDROID__
-    .antialias = AA_OFF,  // Android: SMAA costs 6 fullscreen passes, too heavy for mobile GPUs
+    .astc_quality = 10,  // fast by default: keeps the first-use transcode hitch short
+#if defined(__ANDROID__) || defined(__OHOS__)
+    .antialias = AA_OFF,  // Android/OHOS: SMAA costs 6 fullscreen passes, too heavy for mobile GPUs
 #else
     .antialias = AA_SMAA,  // (the game has no anti-aliasing of its own)
 #endif
@@ -175,6 +176,12 @@ static void parse_line(const char *line) {
         int n = atoi(val);
         g_settings.tex_quality = (n >= 0 && n <= 100) ? n : 100;
     }
+    else if (!strcmp(key, "astc_quality")) {
+        if (!strcmp(val, "fastest")) g_settings.astc_quality = 0;
+        else if (!strcmp(val, "fast")) g_settings.astc_quality = 10;
+        else if (!strcmp(val, "medium")) g_settings.astc_quality = 60;
+        else { int n = atoi(val); g_settings.astc_quality = (n >= 0 && n <= 100) ? n : 10; }
+    }
     else if (!strcmp(key, "profiles_auto")) g_settings.profiles_auto = atoi(val) != 0;
     else if (!strcmp(key, "profiles_version")) g_profiles_version = atoi(val);
     else if (!strcmp(key, "profile_world_height")) g_settings.profile_world_height = atoi(val) >= 360 && atoi(val) <= 4320 ? atoi(val) : 0;
@@ -257,6 +264,8 @@ void settings_save(void) {
     fprintf(f, "profile_world_aspect = %d\n", g_settings.profile_world_aspect);
     fprintf(f, "profile_battle_aspect = %d\n", g_settings.profile_battle_aspect);
     fprintf(f, "tex_quality = %d\n", g_settings.tex_quality);
+    fprintf(f, "astc_quality = %s\n", g_settings.astc_quality <= 0 ? "fastest"
+                                      : g_settings.astc_quality <= 20 ? "fast" : "medium");
     fprintf(f, "game_lang = %s\n", g_settings.game_lang);
     bind_settings_save(f);
     fclose(f);

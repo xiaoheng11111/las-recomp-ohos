@@ -14,6 +14,23 @@ bool osk_is_open(void) { return false; }
 void osk_cancel(void) {}
 bool ui_text_busy(void) { return false; }
 bool ui_input_text_cancelled(void) { return false; }
+
+// menu.mm 的 menu_input_captured：overlay 菜单/改名输入是否独占输入。
+// 第一版没有 ImGui 覆盖菜单（LARECOMP_NO_LAUNCHER=1 直接进游戏），恒返回 false。
+extern "C" bool menu_input_captured(void) { return false; }
+
+// menu.mm（Dear ImGui overlay）其余导出：OHOS 第一版不编 ImGui 菜单，全部空实现。
+// menu_is_open/menu_handle_event：不消费事件（游戏自己处理输入）
+// menu_apply_window_requests：不修改窗口（全屏由 ArkTS EntryAbility 控制）
+// menu_render：不渲染覆盖层
+// menu_test_open：测试钩子，无操作
+extern "C" bool menu_is_open(void) { return false; }
+extern "C" bool menu_handle_event(const void *e) { (void)e; return false; }
+extern "C" void menu_apply_window_requests(void *sdl_window) { (void)sdl_window; }
+extern "C" void menu_render(void *cmd, unsigned int target_w, unsigned int target_h) {
+    (void)cmd; (void)target_w; (void)target_h;
+}
+extern "C" void menu_test_open(void) {}
 bool ui_input_text(const char *label, char *buf, unsigned long size, unsigned int flags, const char *hint,
                    const char *title) {
     (void)label; (void)buf; (void)size; (void)flags; (void)hint; (void)title;

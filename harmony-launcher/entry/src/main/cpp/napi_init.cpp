@@ -237,6 +237,33 @@ static napi_value GetFps(napi_env env, napi_callback_info info) {
 }
 
 
+// ---- 数据采集：桥接 liblasrecomp.so 导出的 las_collect_start/stop（RTLD_DEFAULT 可见）----
+// 为什么走 dlsym：移植层是运行时 dlopen 的，启动器不链接它；但这三个符号在 .so 里是导出（T）。
+typedef int (*CollectStartFn)(int);
+typedef void (*CollectStopFn)(char *out, size_t out_size);
+
+static napi_value StartCollect(napi_env env, napi_callback_info info) {
+    (void)info;
+    CollectStartFn f = (CollectStartFn)dlsym(RTLD_DEFAULT, "las_collect_start");
+    // 0=已开始；-2=已经在采；-1=没有 LARECOMP_DATA_ROOT；-3=运行时还没加载（游戏没起来）
+    int rc = f ? f(0) : -3;
+    napi_value r;
+    napi_create_int32(env, rc, &r);
+    return r;
+}
+
+static napi_value StopCollect(napi_env env, napi_callback_info info) {
+    (void)info;
+    char out[512];
+    out[0] = 0;
+    CollectStopFn f = (CollectStopFn)dlsym(RTLD_DEFAULT, "las_collect_stop");
+    if (f) f(out, sizeof out);
+    napi_value r;
+    napi_create_string_utf8(env, out, NAPI_AUTO_LENGTH, &r);
+    return r;
+}
+
+
 // 软键盘：liblasrecomp 的 swkbd 设置 g_swkbd_state=1 等待；ArkTS 轮询到这里弹原生输入法，再 submit
 static napi_value PollSwkbd(napi_env env, napi_callback_info info) {
     (void)info;
@@ -294,6 +321,8 @@ static napi_value Init(napi_env env, napi_value exports) {
         {"padAxis", nullptr, PadAxis, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"padReset", nullptr, PadReset, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"getFps", nullptr, GetFps, nullptr, nullptr, nullptr, napi_default, nullptr},
+{"startCollect", nullptr, StartCollect, nullptr, nullptr, nullptr, napi_default, nullptr},
+{"stopCollect", nullptr, StopCollect, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"pollSwkbd", nullptr, PollSwkbd, nullptr, nullptr, nullptr, napi_default, nullptr},
         {"submitSwkbd", nullptr, SubmitSwkbd, nullptr, nullptr, nullptr, napi_default, nullptr},
     };

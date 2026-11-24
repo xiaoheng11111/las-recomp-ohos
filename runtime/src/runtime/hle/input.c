@@ -792,6 +792,13 @@ HLE_FUNC("_ZN2nn3hid16GetGestureStatesEPNS0_12GestureStateEi", hid_gesture_state
 
 // Vibration devices: accepted but inert (the SDK's vibration node graph stays recompiled).
 HLE_FUNC("_ZN2nn3hid25InitializeVibrationDeviceERKNS0_21VibrationDeviceHandleE", hid_init_vibration) { (void)c; }
+// Vibration node graph (nn::hid::VibrationNode): the SDK keeps these recompiled, but the recompiled code jumps
+// through a stale/byzeroed pointer once a movie/menu runs (no function at 0x13a00000100 in SyncSampleNumber). No
+// rumble hardware exists behind this port, so the sample-number sync / update are safe no-ops that return 0.
+HLE_FUNC("_ZN2nn3hid13VibrationNode16SyncSampleNumberEv", hid_vibnode_sync) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid13VibrationNode6UpdateEv", hid_vibnode_update) { c->x[0] = 0; }
+HLE_FUNC("_ZN2nn3hid13VibrationNode16SetSampleNumberEl", hid_vibnode_setsample) { c->x[0] = 0; }
+HLE_FUNC("_ZNK2nn3hid13VibrationNode16GetSampleNumberEv", hid_vibnode_getsample) { c->x[0] = 0; }
 // Six-axis (motion) sensor. Let's Go aims Poke Ball throws with the gyro in handheld mode; with no sensor behind it
 // the SDK read garbage and the aim went into the sky. The rest pose is a controller lying level (identity orientation,
 // gravity -z), which keeps the aim centred. The mouse turns this virtual controller (yaw / pitch, input_handle_event

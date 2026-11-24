@@ -11,12 +11,18 @@ build/
 
 # Native build artifacts / prebuilt libraries (build them yourself, see README)
 *.so
+*.so.*
 *.a
+*.a.*
 *.o
 *.obj
 *.dylib
 *.dll
 *.lib
+
+# IDE / TS build caches (regenerated on every build)
+.cache/
+*.tsbuildinfo
 
 # Game data / dumps -- never commit (copyrighted, and huge)
 game-data/

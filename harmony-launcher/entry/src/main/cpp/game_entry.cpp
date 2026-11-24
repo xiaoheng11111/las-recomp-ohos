@@ -577,6 +577,9 @@ static void apply_display_ini_env(void) {
     char aspect[32] = "game";
     double fill = 0.0;
     int movie_max = 0, audout = 200, vk_prof = 0;
+    int collect_on = 0, collect_delay = 10;
+    int tex_nocheck = 0;
+    int astc_rt = 0;   // 默认关（BC 软解）
     bool has_lang = false;
     char line[256];
     while (fgets(line, sizeof line, f)) {
@@ -589,6 +592,10 @@ static void apply_display_ini_env(void) {
         else if (!strcmp(key, "movie_max")) movie_max = atoi(val);
         else if (!strcmp(key, "audout_ms")) audout = atoi(val);
         else if (!strcmp(key, "vk_prof")) vk_prof = atoi(val);
+        else if (!strcmp(key, "collect")) collect_on = atoi(val);
+        else if (!strcmp(key, "tex_nocheck")) tex_nocheck = atoi(val);
+        else if (!strcmp(key, "astc_rt")) astc_rt = atoi(val);
+        else if (!strcmp(key, "collect_delay")) collect_delay = atoi(val);
         else if (!strcmp(key, "game_lang")) has_lang = true;
     }
     fclose(f);
@@ -623,6 +630,16 @@ static void apply_display_ini_env(void) {
     }
     if (vk_prof) setenv("LARECOMP_VK_PROF", "1", 1);
     else unsetenv("LARECOMP_VK_PROF");
+    // ★ 采集需要计时器：exec.c 里的 prof_* 计时（gpu_ms / cpu_exec_ms / 各分项）也由
+    //   LARECOMP_VK_PROF 控制。采集开启时强制打开，否则 PERF 表里这些列全是 0。
+    //   （界面不再提供"帧诊断"开关；这里只是让采集有数据。）
+    if (collect_on > 0) setenv("LARECOMP_VK_PROF", "1", 1);
+    // 纹理校验开关：界面「纹理校验」关闭 -> 跳过哈希/比较（直接输出）
+    if (tex_nocheck > 0) setenv("LARECOMP_TEX_NOCHECK", "1", 1);
+    else unsetenv("LARECOMP_TEX_NOCHECK");
+    // ASTC 转码开关：astc_rt=0 -> 直接 RGBA8 上传（LARECOMP_NO_RT_ASTC=1）
+    if (astc_rt > 0) unsetenv("LARECOMP_NO_RT_ASTC");
+    else setenv("LARECOMP_NO_RT_ASTC", "1", 1);
     OH_LOG_Print(LOG_APP, LOG_INFO, 0x0000, "LasBridge",
                  "display: aspect=%{public}s wide_test=%{public}s movie_max=%{public}s audout=%{public}s",
                  aspect, getenv("LARECOMP_WIDE_TEST") ? getenv("LARECOMP_WIDE_TEST") : "off",

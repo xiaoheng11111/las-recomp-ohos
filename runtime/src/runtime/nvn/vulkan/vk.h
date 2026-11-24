@@ -45,6 +45,10 @@ typedef struct {
     VkSemaphore timeline;      // value = last completed submission number
     VkCommandPool pool;        // render thread only
     bool custom_border, divisor, host_import, shader_int64;
+    // 驱动兼容降级开关的实际生效状态（device.c 里按环境变量决定）
+    //   dyn_render: dynamicRendering 是否已启用（false → 走 VkRenderPass 老路径）
+    //   sync2:      synchronization2 是否已启用（false → 走 1.0 barrier/submit）
+    bool dyn_render, sync2;
     // window
     VkSurfaceKHR surface;
     VkSwapchainKHR swapchain;
@@ -69,7 +73,21 @@ VkCommandBuffer vk_cmd(void);         // current command buffer (outside any ren
 VkCommandBuffer vk_upload_cmd(void);  // upload command buffer of the pending submission
 uint64_t vk_pending_seq(void);        // number the pending submission will get
 uint64_t vk_completed_seq(void);
+uint64_t vk_submitted_seq(void);      // last *submitted* number (truth source for in-flight)
+int      vk_inflight_true(void);      // submitted - completed(timeline): real frames in flight on the GPU
+// v17: every wait is attributed to its call site, so the next device run names the stall instead of guessing.
+typedef enum {
+    VK_WAIT_SITE_DEFAULT = 0,      // misc (buffer destroy, heap rebuild, screenshot)
+    VK_WAIT_SITE_SUB = 1,          // exec.c sub(): command-buffer ring slot reuse
+    VK_WAIT_SITE_FRAME_BEGIN = 2,  // device.c vk_frame_begin: swapchain slot_seq
+    VK_WAIT_SITE_FENCE = 3,        // renderer_wait_seq: the NVN fence wait (nvnSyncWait)
+    VK_WAIT_SITE_FLUSH = 4,        // renderer_flush
+    VK_WAIT_SITE_SYNC = 5,         // renderer_sync (nvnQueueFinish)
+    VK_WAIT_SITE_MISC = 6,         // reserved
+    VK_WAIT_SITE_COUNT = 7
+} VkWaitSite;
 void vk_wait_seq(uint64_t seq);
+void vk_wait_seq_at(uint64_t seq, VkWaitSite site);
 void vk_full_barrier(VkCommandBuffer cb);
 void vk_end_pass(void);
 void vk_submit_extra(VkSemaphore wait, VkSemaphore signal, VkCommandBuffer extra);  // submit + one more cb (present)
@@ -98,7 +116,9 @@ typedef struct TexBackend {
     void *pending_rgba;  // host-produced pixels (video) waiting to be uploaded on the render thread
     uint32_t pending_w, pending_h, pending_stride;
     uint8_t astc_bw, astc_bh;  // ASTC without GPU support: decoded to RGBA8 on upload (runtime/nvn/astc.c)
-    uint8_t bc_kind, bc_srgb;  // BC1/3/4/5 without GPU support: decoded to RGBA8 on upload (runtime/nvn/bc.c)
+    uint8_t bc_kind, bc_srgb;  // BC1/3/4/5 without GPU support: decoded on upload (runtime/nvn/bc.c)
+    uint8_t bc_astc;           // BC transcoded to ASTC 4x4 instead of RGBA8 (runtime/nvn/astc_rt.c)
+    uint8_t bc_no_astc;        // sticky: a non-ASTC view was requested, so this texture stays RGBA8
     bool astc_srgb;
     int reg;  // slot in textures.c's live list + 1 (a reboot destroys them all)
     uint64_t dirty_seq;  // last host write (backend_pool_written) this texture was checked against
@@ -108,6 +128,14 @@ typedef struct TexBackend {
 TexBackend *vk_tex(NvnTexture *t, bool for_render);  // backend image (uploads CPU contents unless for_render)
 VkFormat vk_format(uint32_t nvn_format);
 bool vk_format_alpha_one(uint32_t nvn_format);
+
+// BC 块大小（字节）：BC1/BC4 = 8，BC2/BC3/BC5/BC7 = 16。bc_kind 见 TexBackend.bc_kind。
+static inline uint32_t vk_bc_block_bytes(int bc_kind) {
+    return (bc_kind == 1 || bc_kind == 4) ? 8u : 16u;
+}
+// BC 纹理被 CPU 解码成 RGBA8 后，其在 GPU 上的每像素字节数固定为 4（见 textures.c 的 bc_decode_ldr 路径）。
+// 供 exec.c 的拷贝路径（buffer -> texture / texture -> buffer）统一换算行距，避免把块数据当纹素直通。
+#define VK_BC_DECODED_BPP 4u
 // View of t (optionally through an NVN texture view) for rendering or sampling.
 VkImageView vk_view(NvnTexture *t, const NvnTextureView *v, bool has_view, bool render, int want_textype);
 VkImageView vk_image_view(TexBackend *b, VkImageViewType type, VkFormat fmt, uint32_t lv0, uint32_t nlv, uint32_t ly0,
