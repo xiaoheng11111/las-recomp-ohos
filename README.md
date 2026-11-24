@@ -31,7 +31,7 @@
 | 封面 | 启动开场 |
 |---|---|
 | ![](screenshots/01-cover-full.jpeg) | ![](screenshots/02-game-opening.jpeg) |
-| 游戏内 | 户外植被场景（示例约 18 fps / 104 ms） |
+| 游戏内 | 户外植被场景（图为 v0.2.0 旧图 18 fps；**v17.8 已满帧**） |
 | ![](screenshots/03-game-room.jpeg) | ![](screenshots/04-outdoor-fps.jpeg) |
 
 ## 上游遗留问题：游戏文字不可见（已修复）
@@ -160,8 +160,12 @@ harmony-launcher/entry/src/main/cpp/third_party/liblasgame.so
 
 ## 已知问题 / 现状
 
-- 户外/植被场景帧率下降明显（实机示例：18 fps / 104 ms，仅作参考，随设备与场景变化）；主因是绘制调用（draw calls）的 CPU 瓶颈，降低分辨率帮助有限，后续方向是合批/实例化；
-- 标题动画呈现阶段可能有掉帧；
+- **帧率现状（v17.8 实机）**：基本 **20~30 fps**，大部分场景稳定**满帧（30 fps 上限）**，户外植被场景亦如此。
+  此前「户外/植被场景掉到 18 fps / 104 ms」的问题已解决 —— 根因**不是**绘制调用数量，而是
+  链接的 shaderc 静态库把转换层生成的 `#version 460` GLSL 强制降级到 450，导致
+  fragment shader 编译失败、该 program 的**全部** draw 被跳过（越远的区域新 shader 越多，
+  缺失越明显）。换成 `force=0` 的补丁库后 `failed` 计数归零，物体与帧率一并恢复。
+- 标题动画 / 过场等非角色控制场景偶有轻微掉帧（20~30 fps 区间内）；
 - 稳定版运行时下，「＋/－」触发的 ImGui 菜单可能崩溃（已回退到稳定运行库以优先保证游戏不闪退）；
 - 语言与「跳过选择手柄画面」依赖游戏本体行为，可能不响应；
 - 不同 OHOS 版本的 Vulkan/媒体服务行为存在差异。
